@@ -22,6 +22,8 @@ Environment="OXY_HOST=unblock.oxylabs.io"
 Environment="OXY_PORT=60000"
 # 2Captcha (misma key que gestion_documental / verification_api)
 Environment="API_KEY_2CAPTCHA=e716e4f00d5e2225bcd8ed2a04981fe3"
+# Para probar sin proxy (validar que el token es aceptado): descomentar la siguiente línea
+# Environment="SII_SCRAPER_USE_PROXY=false"
 ExecStart=/home/pc/carrierSync/venv/bin/uvicorn vm_services.sii_scraper_api:app --host 0.0.0.0 --port 8082
 Restart=always
 RestartSec=10

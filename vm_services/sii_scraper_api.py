@@ -545,7 +545,10 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
                                 "error": None,
                             }
                         if isinstance(api_result, dict) and api_result.get("captchaInvalido") is True:
-                            logger.warning("[SII] API getConsultaData devolvió captchaInvalido=true")
+                            logger.warning(
+                                "[SII] API getConsultaData devolvió captchaInvalido=true (el backend del SII valida el token con Google; 2Captcha lo genera desde otra IP). Respuesta: %s",
+                                {k: v for k, v in api_result.items() if k != "reToken"},
+                            )
                     except Exception as api_err:
                         logger.warning("[SII] Error llamando API getConsultaData: %s", api_err)
                 time.sleep(1)
@@ -585,6 +588,10 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
                 (debug_dir / "sii_no_open_btn_url.txt").write_text(driver.current_url or "", encoding="utf-8")
             except Exception as ex:
                 logger.warning("[SII] No se pudo guardar debug: %s", ex)
+            logger.warning(
+                "[SII] RUT %s: resultado success=False not_found=True por ReCaptcha (SII rechazó headless/proxy). Pruebe SII_SCRAPER_USE_PROXY=false para validar.",
+                rut,
+            )
             return {
                 "success": False,
                 "activities": [],
