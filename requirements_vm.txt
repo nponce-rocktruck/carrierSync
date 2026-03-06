@@ -8,6 +8,7 @@ pydantic==2.5.0
 # Automatización navegador
 selenium>=4.15.0
 webdriver-manager>=4.0.0
+undetected-chromedriver>=3.5.0
 
-# 2Captcha (reCAPTCHA) - mismo uso que gestion_documental/verification_api
+# HTTP para API SII
 requests>=2.28.0

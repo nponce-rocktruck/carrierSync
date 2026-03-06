@@ -45,6 +45,14 @@ except ImportError:
     SELENIUM_AVAILABLE = False
     logger.warning("Selenium no disponible; instalar requirements_vm.txt en la VM")
 
+try:
+    import undetected_chromedriver as uc
+    UC_AVAILABLE = True
+except ImportError:
+    UC_AVAILABLE = False
+    uc = None
+    logger.info("undetected_chromedriver no instalado; se usará Selenium estándar")
+
 app = FastAPI(title="CarrierSync VM - SII Scraper", version="1.0.0")
 
 # ----------------------------
@@ -68,6 +76,9 @@ SII_GET_CONSULTA_DATA_URL = "https://www2.sii.cl/app/stc/recurso/v1/consulta/get
 SII_RECAPTCHA_PAGE_ACTION = os.getenv("SII_RECAPTCHA_PAGE_ACTION", "consultaSTC")
 
 TOKEN_QUEUE_SIZE = int(os.getenv("TOKEN_QUEUE_SIZE", "100"))
+
+# Undetected Chrome: menos detección por reCAPTCHA (usar si está instalado)
+SII_USE_UC = UC_AVAILABLE and os.getenv("SII_USE_UC", "true").lower() in ("true", "1", "yes")
 
 # --- Limpieza de espacio en disco (evitar llenar /tmp con sesiones viejas) ---
 VM_TEMP_BASE = Path(os.getenv("VM_TEMP_BASE_DIR", "/tmp/carriersync_scraper"))
@@ -176,6 +187,8 @@ def _cleanup_old_sessions() -> int:
         for p in VM_TEMP_BASE.iterdir():
             if not p.is_dir():
                 continue
+            if p.name == "sii_main_profile":
+                continue
             try:
                 age = now - p.stat().st_mtime
                 if age > max_age_sec:
@@ -247,6 +260,46 @@ def _parsear_fecha_sii(texto: str) -> Optional[datetime]:
 # ----------------------------
 # DRIVER (una sola vez al inicio)
 # ----------------------------
+def _crear_driver_uc():
+    """Crea un driver con undetected_chromedriver (Google no lo detecta como bot)."""
+    if not UC_AVAILABLE or uc is None:
+        return None, None
+    VM_TEMP_BASE.mkdir(parents=True, exist_ok=True)
+    profile_dir = VM_TEMP_BASE / "sii_main_profile"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    options = uc.ChromeOptions()
+    if os.getenv("HEADLESS", "true").lower() in ("true", "1", "yes"):
+        options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+
+    proxy_cfg = _get_proxy_config()
+    if proxy_cfg:
+        try:
+            ext_path = _crear_proxy_auth_extension(
+                proxy_cfg["host"], proxy_cfg["port"],
+                proxy_cfg["username"], proxy_cfg["password"],
+                profile_dir,
+            )
+            options.add_argument(f"--load-extension={ext_path}")
+            logger.info("[SII] Proxy residencial configurado (UC): %s:%s", proxy_cfg["host"], proxy_cfg["port"])
+        except Exception as e:
+            logger.warning("[SII] No se pudo crear extensión de proxy para UC: %s", e)
+    elif not SII_SCRAPER_USE_PROXY:
+        logger.info("[SII] Proxy desactivado (SII_SCRAPER_USE_PROXY=false)")
+
+    try:
+        dr = uc.Chrome(options=options, user_data_dir=str(profile_dir))
+        dr.set_script_timeout(60)
+        dr.set_page_load_timeout(60)
+        logger.info("[SII] Navegador UC listo (perfil persistente: %s)", profile_dir)
+        return dr, profile_dir
+    except Exception as e:
+        logger.error("[SII] Error al iniciar UC: %s", e)
+        return None, None
+
+
 def _crear_driver(headless: bool = True):
     """
     Crea el driver de Chrome usando un directorio temporal propio.
@@ -295,7 +348,10 @@ def _crear_driver(headless: bool = True):
         service = Service(ChromeDriverManager().install())
         dr = webdriver.Chrome(service=service, options=options)
         dr.set_page_load_timeout(60)
-        dr.set_script_timeout(90)
+        # Timeout alto para reCAPTCHA con proxy (Oxylabs puede ser lento)
+        script_timeout_sec = 120
+        dr.set_script_timeout(script_timeout_sec)
+        logger.info("[SII] Script timeout del driver: %ds", script_timeout_sec)
         dr.implicitly_wait(5)
         return dr, session_dir_path
     except Exception as e:
@@ -310,7 +366,10 @@ def _crear_driver(headless: bool = True):
 def iniciar_navegador() -> None:
     """Inicializa el navegador global una sola vez y carga la página del SII."""
     global driver, session_dir
-    driver, session_dir = _crear_driver(headless=True)
+    if SII_USE_UC:
+        driver, session_dir = _crear_driver_uc()
+    else:
+        driver, session_dir = _crear_driver(headless=True)
     if not driver:
         logger.error("[SII] No se pudo crear el driver Chrome")
         return
@@ -321,54 +380,179 @@ def iniciar_navegador() -> None:
     logger.info("[SII] Navegador SII listo")
 
 
-# ----------------------------
-# GENERADOR DE TOKENS (thread)
-# ----------------------------
-def token_generator() -> None:
-    """Thread que genera tokens reCAPTCHA y los pone en token_queue."""
+def _generar_un_token() -> Optional[str]:
+    """Genera un solo token (mismo script que el thread). Para precalentar al inicio."""
     global driver
-    sitekey = (SII_RECAPTCHA_SITEKEY or SII_RECAPTCHA_SITEKEY_DEFAULT or "").strip()
-    if not sitekey:
-        sitekey = SII_RECAPTCHA_SITEKEY_DEFAULT
-    while True:
-        try:
-            if token_queue.full():
-                time.sleep(1)
-                continue
-            if not driver:
-                time.sleep(2)
-                continue
-            driver.set_script_timeout(90)
+    if not driver:
+        return None
+    sitekey = (SII_RECAPTCHA_SITEKEY or SII_RECAPTCHA_SITEKEY_DEFAULT or "").strip() or SII_RECAPTCHA_SITEKEY_DEFAULT
+    try:
+        if SII_USE_UC:
+            driver.set_script_timeout(60)
             token = driver.execute_async_script(
                 """
                 const sitekey = arguments[0];
                 const action = arguments[1];
                 const callback = arguments[arguments.length - 1];
-                var done = false;
-                function finish(t) {
-                    if (done) return;
-                    done = true;
-                    callback(t || null);
-                }
-                setTimeout(function() { finish(null); }, 80000);
-                if (typeof grecaptcha === 'undefined' || !grecaptcha.enterprise) {
-                    finish(null);
-                    return;
-                }
+                if (typeof grecaptcha === 'undefined' || !grecaptcha.enterprise) { callback(null); return; }
                 grecaptcha.enterprise.ready(function() {
                     grecaptcha.enterprise.execute(sitekey, { action: action })
-                        .then(function(t) { finish(t); })
-                        .catch(function() { finish(null); });
+                        .then(function(t) { callback(t); })
+                        .catch(function() { callback(null); });
                 });
                 """,
                 sitekey,
                 SII_RECAPTCHA_PAGE_ACTION,
             )
-            if token and isinstance(token, str) and len(token) > 20:
-                token_queue.put(token)
-        except Exception as e:
-            logger.error("[SII] Error generando token: %s", e)
-            time.sleep(2)
+        else:
+            driver.set_script_timeout(SCRIPT_TIMEOUT_SEC)
+            token = driver.execute_async_script(
+                """
+                const sitekey = arguments[0];
+                const action = arguments[1];
+                const callback = arguments[arguments.length - 1];
+                const fallbackMs = arguments[2];
+                var done = false;
+                function finish(t) { if (done) return; done = true; callback(t || null); }
+                setTimeout(function() { finish(null); }, fallbackMs);
+                if (typeof grecaptcha === 'undefined' || !grecaptcha.enterprise) { finish(null); return; }
+                grecaptcha.enterprise.ready(function() {
+                    grecaptcha.enterprise.execute(sitekey, { action: action })
+                        .then(function(t) { finish(t); }).catch(function() { finish(null); });
+                });
+                """,
+                sitekey,
+                SII_RECAPTCHA_PAGE_ACTION,
+                JS_FALLBACK_MS,
+            )
+        if token and isinstance(token, str) and len(token) > 20 and not token.startswith("error_"):
+            return token
+    except Exception as e:
+        logger.warning("[SII] Precalentar token: %s", e)
+    return None
+
+
+# ----------------------------
+# GENERADOR DE TOKENS (thread)
+# ----------------------------
+SCRIPT_TIMEOUT_SEC = 120
+JS_FALLBACK_MS = 115000  # callback antes del timeout de Selenium (solo Selenium estándar)
+
+
+def token_generator() -> None:
+    """Thread que genera tokens reCAPTCHA. Con UC reinicia el driver si falla."""
+    global driver, session_dir
+    sitekey = (SII_RECAPTCHA_SITEKEY or SII_RECAPTCHA_SITEKEY_DEFAULT or "").strip()
+    if not sitekey:
+        sitekey = SII_RECAPTCHA_SITEKEY_DEFAULT
+
+    while True:
+        if SII_USE_UC:
+            if not driver:
+                logger.info("[SII] Iniciando/Reiniciando navegador UC...")
+                driver, session_dir = _crear_driver_uc()
+                if driver:
+                    try:
+                        driver.get(SII_CONSULTA_URL)
+                        WebDriverWait(driver, 30).until(
+                            lambda d: d.execute_script("return window.grecaptcha && window.grecaptcha.enterprise")
+                        )
+                    except Exception as e:
+                        logger.warning("[SII] Error cargando SII en UC: %s", e)
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+                        driver = None
+                else:
+                    time.sleep(10)
+                    continue
+
+            try:
+                if token_queue.full():
+                    time.sleep(5)
+                    continue
+                token = driver.execute_async_script(
+                    """
+                    const sitekey = arguments[0];
+                    const action = arguments[1];
+                    const callback = arguments[arguments.length - 1];
+                    if (typeof grecaptcha === 'undefined' || !grecaptcha.enterprise) {
+                        callback('error_no_api');
+                        return;
+                    }
+                    grecaptcha.enterprise.ready(function() {
+                        grecaptcha.enterprise.execute(sitekey, { action: action })
+                            .then(function(t) { callback(t); })
+                            .catch(function(e) { callback('error_' + e); });
+                    });
+                    """,
+                    sitekey,
+                    SII_RECAPTCHA_PAGE_ACTION,
+                )
+                if token and isinstance(token, str) and not token.startswith("error_"):
+                    token_queue.put(token)
+                else:
+                    logger.warning("[SII] ReCAPTCHA devolvió: %s", token)
+                    time.sleep(2)
+            except Exception as e:
+                logger.error("[SII] Error en el loop de tokens (UC): %s", e)
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = None
+                time.sleep(5)
+        else:
+            try:
+                if token_queue.full():
+                    time.sleep(1)
+                    continue
+                if not driver:
+                    time.sleep(2)
+                    continue
+                try:
+                    driver.set_script_timeout(SCRIPT_TIMEOUT_SEC)
+                except Exception:
+                    pass
+                token = driver.execute_async_script(
+                    """
+                    const sitekey = arguments[0];
+                    const action = arguments[1];
+                    const callback = arguments[arguments.length - 1];
+                    const fallbackMs = arguments[2];
+                    var done = false;
+                    function finish(t) {
+                        if (done) return;
+                        done = true;
+                        callback(t || null);
+                    }
+                    setTimeout(function() { finish(null); }, fallbackMs);
+                    if (typeof grecaptcha === 'undefined' || !grecaptcha.enterprise) {
+                        finish(null);
+                        return;
+                    }
+                    grecaptcha.enterprise.ready(function() {
+                        grecaptcha.enterprise.execute(sitekey, { action: action })
+                            .then(function(t) { finish(t); })
+                            .catch(function() { finish(null); });
+                    });
+                    """,
+                    sitekey,
+                    SII_RECAPTCHA_PAGE_ACTION,
+                    JS_FALLBACK_MS,
+                )
+                if token and isinstance(token, str) and len(token) > 20:
+                    token_queue.put(token)
+            except Exception as e:
+                err_str = str(e)
+                if "script timeout" in err_str.lower():
+                    logger.warning("[SII] Token: script timeout (aumentar SCRIPT_TIMEOUT_SEC si el proxy es lento)")
+                elif "Connection" in err_str or "Remote" in err_str:
+                    logger.warning("[SII] Token: Chrome/driver no disponible (%s)", err_str[:80])
+                else:
+                    logger.error("[SII] Error generando token: %s", e)
+                time.sleep(2)
 
 
 # ----------------------------
@@ -389,7 +573,7 @@ def _consultar_sii_api(rut: str) -> Dict[str, Any]:
         return {"success": False, "activities": [], "not_found": False, "error": "RUT inválido"}
 
     try:
-        token = token_queue.get(timeout=95)
+        token = token_queue.get(timeout=125)
     except queue.Empty:
         logger.error("[SII] Timeout esperando token de la cola")
         return {"success": False, "activities": [], "not_found": False, "error": "No hay tokens reCAPTCHA disponibles (timeout)"}
@@ -450,7 +634,7 @@ def _consultar_sii_api(rut: str) -> Dict[str, Any]:
 # ----------------------------
 @app.on_event("startup")
 def startup():
-    """Al iniciar: limpieza de sesiones viejas, un navegador, y thread generador de tokens."""
+    """Al iniciar: limpieza, navegador, precalentar 1 token, y thread generador de tokens."""
     try:
         removed = _cleanup_old_sessions()
         if removed > 0:
@@ -461,6 +645,13 @@ def startup():
 
     iniciar_navegador()
     if driver:
+        logger.info("[SII] Precalentando primer token (timeout %ds)...", SCRIPT_TIMEOUT_SEC)
+        primer_token = _generar_un_token()
+        if primer_token:
+            token_queue.put(primer_token)
+            logger.info("[SII] Primer token en cola (precalentado)")
+        else:
+            logger.warning("[SII] No se pudo precalentar token; el thread intentará llenar la cola")
         t = threading.Thread(target=token_generator, daemon=True)
         t.start()
         logger.info("[SII] Generador de tokens iniciado")
@@ -470,7 +661,7 @@ def startup():
 
 @app.on_event("shutdown")
 def shutdown():
-    """Al apagar: cerrar navegador y borrar directorio de sesión (limpieza de memoria)."""
+    """Al apagar: cerrar navegador. No borrar sii_main_profile (perfil persistente UC)."""
     global driver, session_dir
     if driver:
         try:
@@ -480,12 +671,15 @@ def shutdown():
             logger.warning("Error al cerrar driver: %s", e)
         driver = None
     if session_dir and session_dir.exists():
-        try:
-            shutil.rmtree(session_dir, ignore_errors=True)
-            logger.info("[SII] Sesión borrada: %s", session_dir)
-        except Exception as e:
-            logger.warning("No se pudo borrar sesión %s: %s", session_dir, e)
-        session_dir = None
+        if session_dir.name == "sii_main_profile":
+            logger.info("[SII] Perfil UC persistente conservado: %s", session_dir)
+        else:
+            try:
+                shutil.rmtree(session_dir, ignore_errors=True)
+                logger.info("[SII] Sesión borrada: %s", session_dir)
+            except Exception as e:
+                logger.warning("No se pudo borrar sesión %s: %s", session_dir, e)
+    session_dir = None
 
 
 # ----------------------------
@@ -493,7 +687,13 @@ def shutdown():
 # ----------------------------
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "sii-scraper-vm", "selenium": SELENIUM_AVAILABLE}
+    return {
+        "status": "healthy",
+        "service": "sii-scraper-vm",
+        "selenium": SELENIUM_AVAILABLE,
+        "undetected_chrome": UC_AVAILABLE,
+        "use_uc": SII_USE_UC,
+    }
 
 
 @app.post("/api/v1/cleanup")
