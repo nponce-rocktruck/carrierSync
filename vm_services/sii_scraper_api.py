@@ -328,12 +328,12 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
         driver.execute_script("arguments[0].scrollIntoView(true);", btn_consultar)
         driver.execute_script("arguments[0].click();", btn_consultar)
         logger.info("[SII] Click en Consultar Situación Tributaria, esperando carga...")
-        time.sleep(2)
+        time.sleep(6)  # SPA: dar tiempo a que el SII renderice resultados (proxy/headless puede ser lento)
 
-        # Botón desplegar actividades (en headless puede tardar más)
+        # Botón desplegar actividades (en headless + proxy puede tardar bastante)
         btn_desplegar_clicked = False
         try:
-            btn_desplegar = WebDriverWait(driver, 15).until(
+            btn_desplegar = WebDriverWait(driver, 30).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, "button.open-btn"))
             )
             driver.execute_script("arguments[0].click();", btn_desplegar)

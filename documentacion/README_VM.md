@@ -208,7 +208,13 @@ Si los RUTs salen como *not_found_sii* o *Sin actividades en respuesta SII*, en 
    - `[SII] Tabla DataTables_Table_0 visible, filas encontradas: N` — Cuántas filas se leyeron.
    - `[SII] RUT ... resultado: success=..., activities=N` — Resumen final.
 
-Si aparece *No se encontró botón open-btn*: el SII no está mostrando actividades para ese RUT (o la página tardó más de 10 s). Si aparece *filas encontradas: 0*: la tabla está vacía. Si hay filas pero *activities=0*: la estructura de columnas puede haber cambiado (revisar selectores en `vm_services/sii_scraper_api.py`).
+Si aparece *No se encontró botón open-btn*: el SII no está mostrando actividades para ese RUT (o la página tardó más de 30 s en renderizar). Si aparece *filas encontradas: 0*: la tabla está vacía. Si hay filas pero *activities=0*: la estructura de columnas puede haber cambiado (revisar selectores en `vm_services/sii_scraper_api.py`).
+
+**Revisar qué devolvió el SII cuando no hay botón:** en la VM, tras una consulta que haya guardado debug:
+```bash
+grep -iE 'open-btn|DataTables|actividad|sin actividad|Situación' /tmp/carriersync_scraper/debug/sii_no_open_btn.html | head -30
+```
+Así ves si en el HTML hay tabla, botón con otro nombre o mensaje "sin actividades".
 
 ---
 
