@@ -79,6 +79,8 @@ TOKEN_QUEUE_SIZE = int(os.getenv("TOKEN_QUEUE_SIZE", "100"))
 
 # Undetected Chrome: menos detección por reCAPTCHA (usar si está instalado)
 SII_USE_UC = UC_AVAILABLE and os.getenv("SII_USE_UC", "true").lower() in ("true", "1", "yes")
+# Versión principal de Chrome para UC (ej: 145, 146). Si 0 o vacío, UC auto-detecta.
+UC_VERSION_MAIN = int(os.getenv("UC_VERSION_MAIN", "145") or "0")
 
 # --- Limpieza de espacio en disco (evitar llenar /tmp con sesiones viejas) ---
 VM_TEMP_BASE = Path(os.getenv("VM_TEMP_BASE_DIR", "/tmp/carriersync_scraper"))
@@ -290,7 +292,11 @@ def _crear_driver_uc():
         logger.info("[SII] Proxy desactivado (SII_SCRAPER_USE_PROXY=false)")
 
     try:
-        dr = uc.Chrome(options=options, user_data_dir=str(profile_dir))
+        kwargs = {"options": options, "user_data_dir": str(profile_dir)}
+        if UC_VERSION_MAIN > 0:
+            kwargs["version_main"] = UC_VERSION_MAIN
+            logger.info("[SII] UC usando version_main=%s", UC_VERSION_MAIN)
+        dr = uc.Chrome(**kwargs)
         dr.set_script_timeout(60)
         dr.set_page_load_timeout(60)
         logger.info("[SII] Navegador UC listo (perfil persistente: %s)", profile_dir)
@@ -467,6 +473,14 @@ def token_generator() -> None:
                 else:
                     time.sleep(10)
                     continue
+
+            # Verificación de salud del driver antes de ejecutar (evita RemoteDisconnected)
+            try:
+                _ = driver.current_url
+            except Exception:
+                logger.warning("[SII] Driver perdido, reiniciando...")
+                driver = None
+                continue
 
             try:
                 if token_queue.full():
