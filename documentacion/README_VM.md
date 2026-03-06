@@ -43,7 +43,6 @@ Si dice que la regla ya existe, sigue al siguiente paso.
 ```powershell
 gcloud compute ssh mv-2-southamerica --zone=southamerica-west1-b --project=gestiondocumental-473815```
 
-(Ajusta nombre y zona si son distintos.)
 
 Cuando veas algo como `pc@mv-2-southamerica:~$` ya estás **dentro de la VM**. Los siguientes comandos son en la VM.
 
@@ -72,14 +71,6 @@ sudo apt-get install -y chromium-browser
 cd /home/pc
 ```
 
-Si **no** tienes aún la carpeta `carrierSync`:
-
-```bash
-git clone https://github.com/TU_USUARIO/carrierSync.git
-cd carrierSync
-```
-
-(Cambia `TU_USUARIO` por tu usuario u org de GitHub.)
 
 Si **ya** tienes `carrierSync`:
 

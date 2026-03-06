@@ -28,20 +28,39 @@ carrierSync/
 └── documentacion/       # Guía ambientes, doc técnica giros
 ```
 
-## Desarrollo local
+## Probar en local (API + VM + base de datos dev)
 
-```bash
-# Dependencias
+Para probar todo en tu PC apuntando a la **base de datos de dev** y a la **VM del scraper** (sin desplegar en Cloud):
+
+1. **VM ya configurada** (firewall 8082 + scraper corriendo en la VM, ver [README_VM.md](documentacion/README_VM.md)).
+
+2. **Variables de entorno:** En la raíz del proyecto ten **env.dev.yaml** con al menos:
+   - `MONGODB_URL`, `MONGODB_DATABASE` (base de dev, ej. `Rocktruck` o `Samanta_Dev`),
+   - `VM_SII_SCRAPER_URL` (ej. `http://34.176.102.209:8082`).
+   La app carga automáticamente `env.dev.yaml` cuando corres en local (no en Cloud Run).
+
+3. **Desde la raíz del proyecto** (ej. `C:\Users\pc\Documents\GitHub\carrierSync`):
+
+```powershell
+# Dependencias (solo la primera vez)
 pip install -r requirements.txt
 
-# Variables (crear .env o exportar)
-# MONGODB_URL, MONGODB_DATABASE, VM_SII_SCRAPER_URL (opcional si no tienes VM)
-
-# Ejecutar API
+# Levantar la API en local (puerto 8000)
 python main.py
-# o
+```
+
+   O con recarga al cambiar código:
+
+```powershell
 uvicorn main:app --reload --port 8000
 ```
+
+4. **Probar:**
+   - **Health:** http://localhost:8000/health  
+   - **Docs:** http://localhost:8000/docs  
+   - **Carga de giros:** POST http://localhost:8000/api/v1/carga-giros con body por ejemplo `{"run_type": "inicial"}` o `{"run_type": "inicial", "rut_list": ["12345678-9"]}` para un solo RUT. La API usará la VM (`VM_SII_SCRAPER_URL`) y escribirá en la base de dev (`MONGODB_DATABASE`).
+
+Si quieres sobreescribir algo (ej. otra base), crea un `.env` con las variables que necesites; se aplican después de `env.dev.yaml`.
 
 ## Despliegue Cloud Run (Windows)
 
@@ -69,14 +88,17 @@ Configurar en **ambos** `env.dev.yaml` y `env.prod.yaml` la **misma** variable *
 
 | Método | Ruta | Descripción |
 |--------|------|-------------|
-| POST | /api/v1/carga-giros | Inicia carga/actualización de giros (body: run_type, opcional rut_list, carrier_ids). Devuelve job_id. |
-| GET | /api/v1/carga-giros/{job_id} | Estado del job (totales, status). |
-| GET | /api/v1/carga-giros/{job_id}/detalle | Detalle completo (incluye details por carrier). |
+| POST | /api/v1/carga-giros | Inicia carga/actualización de giros (body: run_type, opcional rut_list, carrier_ids). Devuelve job_id, total_carriers y **ruts_no_encontrados_en_rt_carrier** (RUTs enviados que no están en RT_carrier). |
+| GET | /api/v1/carga-giros/{job_id} | Estado del job (totales, status, ruts_no_encontrados_en_rt_carrier). |
+| GET | /api/v1/carga-giros/{job_id}/detalle | Detalle completo (incluye details por carrier y ruts_no_encontrados_en_rt_carrier). |
 | GET | /api/v1/carga-giros | Lista de jobs (query: limit, run_type). |
 | GET | /health | Health check. |
 
+Cuando se envía **rut_list**, la respuesta indica cuántos carriers se procesarán (`total_carriers`) y qué RUTs de la lista no existen en RT_carrier (`ruts_no_encontrados_en_rt_carrier`). Ver [Cómo llamar al servicio](documentacion/COMO_LLAMAR_SERVICIO.md) para la estructura completa de las respuestas.
+
 ## Documentación
 
+- **[Cómo llamar al servicio](documentacion/COMO_LLAMAR_SERVICIO.md)** – Ejemplos: todos los RUTs, lista de RUTs, por carrier_id (ObjectId), consultar estado del job.
 - [Guía ambientes Dev/Prod](documentacion/GUIA_AMBIENTES_DEV_PROD.md) (incluye compartir la VM con gestion_documental)
 - [Documentación técnica giros](documentacion/DOCUMENTACION_TECNICA_GIROS.md)
 - **Solo comandos:** [Cloud – crear proyecto y desplegar](documentacion/SETUP_CLOUD_PASO_A_PASO.md) | [VM – todo en uno (script + comandos)](documentacion/README_VM.md)

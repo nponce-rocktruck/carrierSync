@@ -72,6 +72,21 @@ def _normalizar_rut(rut: str) -> str:
     return s
 
 
+def _rut_con_puntos(rut_normalizado: str) -> str:
+    """Formatea RUT con puntos de miles para el SII (ej: 17807161-0 -> 17.807.161-0)."""
+    if not rut_normalizado or "-" not in rut_normalizado:
+        return rut_normalizado or ""
+    numero, dv = rut_normalizado.rsplit("-", 1)
+    numero = numero.replace(".", "")
+    if not numero.isdigit():
+        return rut_normalizado
+    partes = []
+    while numero:
+        partes.append(numero[-3:])
+        numero = numero[:-3]
+    return ".".join(reversed(partes)) + "-" + dv.upper()
+
+
 def _parsear_fecha_sii(texto: str) -> Optional[datetime]:
     """Intenta parsear fecha tipo dd-mm-yyyy o similar."""
     if not texto or not texto.strip():
@@ -198,10 +213,11 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
         driver.get("https://www2.sii.cl/stc/noauthz")
         wait = WebDriverWait(driver, 15)
 
-        # Ingresar RUT
+        # Ingresar RUT en formato que espera el SII: 17.807.161-0 (con puntos de miles)
         input_rut = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input.rut-form")))
         input_rut.clear()
-        input_rut.send_keys(rut)
+        rut_para_sii = _rut_con_puntos(rut)
+        input_rut.send_keys(rut_para_sii)
         time.sleep(0.5)
 
         # Consultar Situación Tributaria

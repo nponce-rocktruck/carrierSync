@@ -65,6 +65,7 @@ class CargaGirosResponse(BaseModel):
     not_processed: int = 0
     details: List[CarrierGirosSyncLogEntry] = Field(default_factory=list)
     message: Optional[str] = None
+    ruts_no_encontrados_en_rt_carrier: List[str] = Field(default_factory=list)
 
 
 class JobStatusResponse(BaseModel):
@@ -81,3 +82,4 @@ class JobStatusResponse(BaseModel):
     sii_failed: int
     not_processed: int
     details_count: int
+    ruts_no_encontrados_en_rt_carrier: List[str] = Field(default_factory=list)

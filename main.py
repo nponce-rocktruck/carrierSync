@@ -17,11 +17,35 @@ from utils.logging_utils import configure_logging
 configure_logging()
 logger = logging.getLogger(__name__)
 
-if os.path.exists(".env"):
-    load_dotenv()
-    logger.info("Archivo .env encontrado, cargando variables locales")
+
+def _load_local_env():
+    """Carga variables para ejecución local: env.dev.yaml y/o .env."""
+    import yaml
+    env_file = "env.dev.yaml"
+    if os.path.exists(env_file):
+        try:
+            with open(env_file, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            for k, v in (data or {}).items():
+                if v is not None and isinstance(v, (str, int, float, bool)):
+                    os.environ.setdefault(k, str(v))
+            logger.info("Variables cargadas desde %s (ejecución local)", env_file)
+        except Exception as e:
+            logger.warning("No se pudo cargar %s: %s", env_file, e)
+    if os.path.exists(".env"):
+        load_dotenv()
+        logger.info("Archivo .env encontrado, variables locales aplicadas")
+    elif not os.path.exists(env_file):
+        logger.info("Sin .env ni env.dev.yaml; usando variables de entorno del sistema / Cloud Run")
+    else:
+        logger.info("Ejecutándose en local con variables de env.dev.yaml")
+
+
+# Solo cargar env local si no estamos en Cloud Run (K_SERVICE) ni Cloud Functions (FUNCTION_TARGET)
+if not os.getenv("K_SERVICE") and not os.getenv("FUNCTION_TARGET"):
+    _load_local_env()
 else:
-    logger.info("Ejecutándose en producción, usando variables de entorno de Cloud Run")
+    logger.info("Ejecutándose en Cloud, usando variables de entorno del servicio")
 
 # Importar rutas
 health_router = None

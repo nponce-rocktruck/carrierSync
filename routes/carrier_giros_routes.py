@@ -5,6 +5,7 @@ Dispara automatización SII en VM y registra logs en carrier_giros_sync_log.
 
 import logging
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, status
@@ -12,6 +13,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 from models.carrier_models import CargaGirosRequest, CargaGirosResponse, JobStatusResponse
 from services.carrier_giros_service import run_carga_giros, get_carriers_to_process
 from services.sync_log_service import create_sync_job, get_job, list_jobs
+from utils.rut_chileno import normalizar_rut_para_busqueda
 
 logger = logging.getLogger(__name__)
 
@@ -23,10 +25,21 @@ _executor = ThreadPoolExecutor(max_workers=2)
 
 def _run_job_in_background(job_id: str, run_type: str, rut_list: List[str] | None, carrier_ids: List[str] | None):
     """Ejecuta run_carga_giros en un thread (para no bloquear)."""
+    logger.info("Job %s: iniciando proceso en background (run_type=%s)", job_id, run_type)
     try:
-        run_carga_giros(job_id=job_id, run_type=run_type, rut_list=rut_list, carrier_ids=carrier_ids)
+        result = run_carga_giros(job_id=job_id, run_type=run_type, rut_list=rut_list, carrier_ids=carrier_ids)
+        logger.info(
+            "Job %s: completado status=%s processed=%s updated=%s not_found=%s sii_failed=%s not_processed=%s",
+            job_id,
+            result.get("status"),
+            result.get("processed", 0),
+            result.get("updated", 0),
+            result.get("not_found_in_sii", 0),
+            result.get("sii_failed", 0),
+            result.get("not_processed", 0),
+        )
     except Exception as e:
-        logger.exception(f"Error en job {job_id}: {e}")
+        logger.exception("Job %s: fallido con error: %s", job_id, e)
         from database.mongodb_connection import get_collection
         from database.init_database import SYNC_LOG_COLLECTION
         from datetime import datetime
@@ -51,7 +64,30 @@ async def iniciar_carga_giros(request: CargaGirosRequest, background_tasks: Back
     )
     total = len(carriers)
     job_id = str(uuid.uuid4())
-    create_sync_job(job_id=job_id, run_type=request.run_type, total_carriers=total)
+    logger.info(
+        "POST /carga-giros: job_id=%s run_type=%s total_carriers=%s (rut_list=%s carrier_ids=%s)",
+        job_id, request.run_type, total,
+        "sí" if request.rut_list else "no", "sí" if request.carrier_ids else "no",
+    )
+    if total == 0 and request.rut_list:
+        logger.warning(
+            "POST /carga-giros: 0 carriers para rut_list con %s RUT(s). Ejemplo recibido: %s. Verifique que existan en RT_carrier (tax_id o legal_tax_id).",
+            len(request.rut_list), request.rut_list[:5] if request.rut_list else [],
+        )
+    ruts_no_en_rt_carrier: List[str] = []
+    if request.rut_list:
+        requested_norm = set(normalizar_rut_para_busqueda(r) for r in request.rut_list if r)
+        found_norm = set(
+            normalizar_rut_para_busqueda((c.get("tax_id") or c.get("legal_tax_id") or "").strip())
+            for c in carriers
+        )
+        ruts_no_en_rt_carrier = sorted(requested_norm - found_norm)
+    create_sync_job(
+        job_id=job_id,
+        run_type=request.run_type,
+        total_carriers=total,
+        ruts_no_encontrados_en_rt_carrier=ruts_no_en_rt_carrier,
+    )
     # Ejecutar en background
     background_tasks.add_task(
         _run_job_in_background,
@@ -61,13 +97,18 @@ async def iniciar_carga_giros(request: CargaGirosRequest, background_tasks: Back
         request.carrier_ids,
     )
     from datetime import datetime
+    msg = f"Job iniciado. Total carriers a procesar: {total}."
+    if ruts_no_en_rt_carrier:
+        msg += f" RUT(s) no encontrado(s) en RT_carrier: {', '.join(ruts_no_en_rt_carrier)}."
+    msg += f" Consulta GET /api/v1/carga-giros/{job_id} para el estado."
     return CargaGirosResponse(
         job_id=job_id,
         run_type=request.run_type,
         status="running",
         started_at=datetime.utcnow(),
         total_carriers=total,
-        message=f"Job iniciado. Total carriers a procesar: {total}. Consulta GET /api/v1/carga-giros/{job_id} para el estado.",
+        message=msg,
+        ruts_no_encontrados_en_rt_carrier=ruts_no_en_rt_carrier,
     )
 
 
@@ -91,6 +132,7 @@ async def estado_carga_giros(job_id: str):
         sii_failed=job.get("sii_failed", 0),
         not_processed=job.get("not_processed", 0),
         details_count=len(details),
+        ruts_no_encontrados_en_rt_carrier=job.get("ruts_no_encontrados_en_rt_carrier", []),
     )
 
 

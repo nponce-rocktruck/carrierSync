@@ -49,12 +49,28 @@ def validar_rut_chileno(rut: str) -> bool:
 
 
 def normalizar_rut_para_busqueda(rut: str) -> str:
-    """Devuelve RUT sin puntos, con guión y mayúscula (ej: 13090093-3)."""
+    """Devuelve RUT sin puntos, con un solo guión antes del dígito verificador (ej: 10444590-K)."""
     if not rut or not isinstance(rut, str):
         return ""
-    s = rut.strip().upper().replace(".", "").replace(" ", "")
+    s = rut.strip().upper().replace(".", "").replace(" ", "").replace("-", "")
     if not s:
         return ""
     if len(s) >= 2 and s[-1] in "0123456789K":
         return f"{s[:-1]}-{s[-1]}"
     return s
+
+
+def rut_con_puntos(rut_normalizado: str) -> str:
+    """Formatea RUT con puntos de miles (ej: 10444590-K -> 10.444.590-K). Usado para buscar en BD donde se guarda así."""
+    if not rut_normalizado or "-" not in rut_normalizado:
+        return rut_normalizado or ""
+    numero, dv = rut_normalizado.rsplit("-", 1)
+    numero = numero.replace(".", "")
+    if not numero.isdigit():
+        return rut_normalizado
+    # Agrupar de derecha a izquierda de 3 en 3
+    partes = []
+    while numero:
+        partes.append(numero[-3:])
+        numero = numero[:-3]
+    return ".".join(reversed(partes)) + "-" + dv.upper()

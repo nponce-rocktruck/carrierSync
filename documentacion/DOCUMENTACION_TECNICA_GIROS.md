@@ -56,9 +56,9 @@ Ejemplo del objeto en un documento de RT_carrier:
 
 Si para un carrier la consulta al SII falla (timeout, RUT no encontrado, etc.), el campo **giros_sync** no se crea ni se modifica; el documento del carrier queda como estaba.
 
-### 2.2 carrier_giros_sync_log (nueva colección)
+### 2.2 carrier_giros_sync_log (colección de log)
 
-Cada ejecución de carga/actualización se registra en un documento con:
+La colección **carrier_giros_sync_log** se crea automáticamente la primera vez que se ejecuta un job (no es necesario crearla a mano). Cada ejecución de carga/actualización se registra en un documento con:
 
 | Campo | Tipo | Descripción |
 |-------|------|-------------|
@@ -67,14 +67,15 @@ Cada ejecución de carga/actualización se registra en un documento con:
 | status | string | `running`, `completed`, `partial`, `failed` |
 | started_at | date | Inicio del job |
 | finished_at | date | Fin (null si sigue running) |
-| total_carriers | int | Total de carriers a procesar |
+| total_carriers | int | Total de carriers a procesar (los que sí existen en RT_carrier) |
 | processed | int | Procesados |
 | updated | int | Actualizados correctamente |
 | not_found_in_sii | int | RUT no encontrado en SII |
 | sii_failed | int | Error al consultar SII (timeout, fallo VM, etc.) |
 | not_processed | int | No procesados (sin tax_id, error al escribir, etc.) |
 | details | array | Lista de entradas por carrier (ver abajo) |
-| message | string | Mensaje opcional (ej. error global) |
+| message | string | Mensaje opcional (ej. error global, "No hay carriers que procesar") |
+| **ruts_no_encontrados_en_rt_carrier** | **array de string** | **Solo cuando el request incluyó `rut_list`.** RUTs (en formato normalizado, ej. `12345678-9`) que el cliente envió en `rut_list` pero que **no tienen documento en RT_carrier**. Permite saber de inmediato qué RUTs no se procesarán. Si no se usó `rut_list` o todos existían, es `[]`. |
 
 Cada elemento de **details**:
 
@@ -108,9 +109,11 @@ Cada elemento de **details**:
    - Al terminar, actualiza el documento del job en `carrier_giros_sync_log` (status, contadores, finished_at, details).
 
 4. **Cliente** puede consultar:
-   - `GET /api/v1/carga-giros/{job_id}`: resumen del job (status, totales).
-   - `GET /api/v1/carga-giros/{job_id}/detalle`: documento completo del job incluyendo `details`.
+   - `GET /api/v1/carga-giros/{job_id}`: resumen del job (status, totales, `ruts_no_encontrados_en_rt_carrier`).
+   - `GET /api/v1/carga-giros/{job_id}/detalle`: documento completo del job incluyendo `details` y `ruts_no_encontrados_en_rt_carrier`.
    - `GET /api/v1/carga-giros`: listado de los últimos jobs (opcional filtro `run_type`).
+
+**Respuestas según el caso:** Si el request incluye `rut_list`, la respuesta inmediata del POST y el documento del job incluyen el campo `ruts_no_encontrados_en_rt_carrier` con los RUTs (normalizados) que no tienen documento en RT_carrier. Así el consumidor sabe de inmediato cuántos carriers se procesarán (`total_carriers`) y cuáles RUTs de su lista no estaban en la base. Estructura detallada de las respuestas (POST, GET estado, GET detalle) en [Cómo llamar al servicio](COMO_LLAMAR_SERVICIO.md#2-respuestas-de-la-api-qué-devuelve-en-cada-caso).
 
 ---
 
