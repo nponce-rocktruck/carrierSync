@@ -295,7 +295,7 @@ def _crear_driver(headless: bool = True):
         service = Service(ChromeDriverManager().install())
         dr = webdriver.Chrome(service=service, options=options)
         dr.set_page_load_timeout(60)
-        dr.set_script_timeout(45)
+        dr.set_script_timeout(90)
         dr.implicitly_wait(5)
         return dr, session_dir_path
     except Exception as e:
@@ -338,12 +338,19 @@ def token_generator() -> None:
             if not driver:
                 time.sleep(2)
                 continue
+            driver.set_script_timeout(90)
             token = driver.execute_async_script(
                 """
                 const sitekey = arguments[0];
                 const action = arguments[1];
                 const callback = arguments[arguments.length - 1];
-                function finish(t) { callback(t || null); }
+                var done = false;
+                function finish(t) {
+                    if (done) return;
+                    done = true;
+                    callback(t || null);
+                }
+                setTimeout(function() { finish(null); }, 80000);
                 if (typeof grecaptcha === 'undefined' || !grecaptcha.enterprise) {
                     finish(null);
                     return;
@@ -382,7 +389,7 @@ def _consultar_sii_api(rut: str) -> Dict[str, Any]:
         return {"success": False, "activities": [], "not_found": False, "error": "RUT inválido"}
 
     try:
-        token = token_queue.get(timeout=30)
+        token = token_queue.get(timeout=95)
     except queue.Empty:
         logger.error("[SII] Timeout esperando token de la cola")
         return {"success": False, "activities": [], "not_found": False, "error": "No hay tokens reCAPTCHA disponibles (timeout)"}
