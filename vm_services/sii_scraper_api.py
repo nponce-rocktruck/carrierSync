@@ -62,6 +62,8 @@ SII_SCRAPER_USE_PROXY = os.getenv("SII_SCRAPER_USE_PROXY", "true").lower() not i
 API_KEY_2CAPTCHA = os.getenv("API_KEY_2CAPTCHA", "e716e4f00d5e2225bcd8ed2a04981fe3")
 SII_RECAPTCHA_SITEKEY = os.getenv("SII_RECAPTCHA_SITEKEY", "").strip()
 SII_CONSULTA_URL = "https://www2.sii.cl/stc/noauthz"
+# Acción para reCAPTCHA v3 Enterprise (el SII usa v3; pageAction típico: submit, consultar)
+SII_RECAPTCHA_PAGE_ACTION = os.getenv("SII_RECAPTCHA_PAGE_ACTION", "consultar")
 
 
 def _get_proxy_config() -> Optional[Dict[str, str]]:
@@ -187,17 +189,18 @@ def _parsear_fecha_sii(texto: str) -> Optional[datetime]:
 
 
 def _resolver_captcha_2captcha(website_url: str, website_key: str) -> Optional[str]:
-    """Resuelve reCAPTCHA con 2captcha (mismo esquema que gestion_documental/verification_api)."""
+    """Resuelve reCAPTCHA con 2captcha. El SII usa v3 Enterprise, no v2."""
     if not API_KEY_2CAPTCHA or not website_key:
         return None
-    logger.info("[SII] Solicitando resolución a 2Captcha...")
+    logger.info("[SII] Solicitando resolución a 2Captcha (reCAPTCHA v3 Enterprise)...")
     payload = {
         "clientKey": API_KEY_2CAPTCHA,
         "task": {
-            "type": "RecaptchaV2EnterpriseTaskProxyless",
+            "type": "RecaptchaV3EnterpriseTaskProxyless",
             "websiteURL": website_url,
             "websiteKey": website_key,
-            "isInvisible": False,
+            "minScore": 0.3,
+            "pageAction": SII_RECAPTCHA_PAGE_ACTION,
         },
     }
     try:
@@ -231,13 +234,14 @@ def _resolver_captcha_2captcha(website_url: str, website_key: str) -> Optional[s
 
 
 def _inyectar_token_captcha(driver, token: str) -> None:
-    """Inyecta token reCAPTCHA y ejecuta callback (igual que verification_api)."""
+    """Inyecta token reCAPTCHA (v2 o v3) y ejecuta callbacks."""
     logger.info("[SII] Inyectando token reCAPTCHA...")
     script_js = """
     var token = arguments[0];
     try {
         var area = document.getElementById('g-recaptcha-response');
         if (area) { area.value = token; area.innerHTML = token; }
+        document.querySelectorAll('input[name="g-recaptcha-response"], input[id="g-recaptcha-response"], textarea[name="g-recaptcha-response"]').forEach(function(el) { el.value = token; });
         if (typeof (___grecaptcha_cfg) !== 'undefined') {
             for (let i in ___grecaptcha_cfg.clients) {
                 let client = ___grecaptcha_cfg.clients[i];
