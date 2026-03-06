@@ -287,7 +287,13 @@ def _obtener_sitekey_sii(driver) -> Optional[str]:
             return null;
         """
         )
-        return (sitekey or "").strip() or None
+        if (sitekey or "").strip():
+            return (sitekey or "").strip()
+        # Fallback: buscar en el HTML (reCAPTCHA sitekeys suelen ser 6L + ~40 caracteres)
+        page_source = driver.page_source or ""
+        match = re.search(r'6L[a-zA-Z0-9_-]{38,52}', page_source)
+        if match:
+            return match.group(0)
     except Exception as e:
         logger.warning("[SII] No se pudo obtener sitekey del DOM: %s", e)
     return None
@@ -452,7 +458,18 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
             else:
                 logger.warning("[SII] 2Captcha no devolvió token, continuando sin él (puede fallar por ReCaptcha)")
         elif not sitekey:
-            logger.debug("[SII] Sin SII_RECAPTCHA_SITEKEY ni sitekey en página; no se usa 2Captcha")
+            logger.info(
+                "[SII] No se detectó sitekey de reCAPTCHA en la página. "
+                "Defina SII_RECAPTCHA_SITEKEY en el servicio (inspeccionar la página del SII en el navegador)."
+            )
+            try:
+                debug_dir = VM_TEMP_BASE / "debug"
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                path = debug_dir / "sii_page_for_sitekey.html"
+                (path).write_text(driver.page_source or "", encoding="utf-8", errors="replace")
+                logger.info("[SII] HTML guardado en %s — ejecute: grep -oE '6L[a-zA-Z0-9_-]{38,52}' %s | head -1", path, path)
+            except Exception as ex:
+                logger.warning("[SII] No se pudo guardar HTML para sitekey: %s", ex)
 
         # Consultar Situación Tributaria
         btn_consultar = wait.until(
