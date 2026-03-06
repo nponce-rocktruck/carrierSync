@@ -1,0 +1,13 @@
+# CarrierSync VM - Scraper SII (ejecutar en la VM, no en Cloud Run)
+# Incluye Selenium y ChromeDriver para automatización del portal SII
+
+fastapi>=0.115.0
+uvicorn[standard]==0.25.0
+pydantic==2.5.0
+
+# Automatización navegador
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+
+# Opcional: proxy Oxylabs (si se usa selenium-wire para proxy con auth)
+# selenium-wire>=5.1.0

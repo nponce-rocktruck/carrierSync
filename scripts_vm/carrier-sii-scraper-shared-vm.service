@@ -1,0 +1,26 @@
+# Servicio para cuando CarrierSync comparte la VM con gestion_documental.
+# VM: 34.176.102.209 | Puerto: 8082
+# gestion_documental usa 8080 (prod) y 8081 (dev).
+#
+# Instalación automática: usar scripts/setup-vm-shared.sh en la VM.
+
+[Unit]
+Description=CarrierSync VM - SII Giros Scraper (puerto 8082, VM compartida)
+After=network.target
+
+[Service]
+Type=simple
+User=pc
+Group=pc
+WorkingDirectory=/home/pc/carrierSync
+Environment="PATH=/home/pc/carrierSync/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment=PORT=8082
+ExecStart=/home/pc/carrierSync/venv/bin/uvicorn vm_services.sii_scraper_api:app --host 0.0.0.0 --port 8082
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=carrier-sii-scraper
+
+[Install]
+WantedBy=multi-user.target

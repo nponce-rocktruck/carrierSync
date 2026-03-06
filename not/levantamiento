@@ -1,0 +1,122 @@
+GESTIÓN DE DATA Y AUTOMATIZACIÓN DE GIROS DE TRANSPORTISTAS
+1. RESUMEN EJECUTIVO
+se necesita desarrollar un proyecto para abordar los procesos que se detallan a continuacion de la manera mas escalable posible ya que por esta pasabda se necesita etraer solo giros, pero idealmente que se extraiga toda la data posible ya sea de sheriff o de la automatizacion como razon social por ejemplo
+
+
+
+3. ANÁLISIS DE LOSPROCESOS CLAVE
+A continuación, se detallan los caminos para cada necesidad de la empresa:
+
+
+PROCESO 1: Carga Masiva e Inicial de Giros
+Objetivo: Poblar la base de datos actual de Samanta (que está incompleta) agregar uno parametro que sea una lista de giros con esta estructura :
+"economicActivities": [
+  {
+    "code": "492300",
+    "description": "TRANSPORTE DE CARGA POR CARRETERA",
+    "category": "Primera",
+    "isVatSubject": true,
+    "startDate": ISODate("2003-09-30T00:00:00Z"),
+    "lastUpdatedAt": ISODate("2026-03-01T00:00:00Z"),
+    "dataSource": "monitoreo",
+    "extractedAt": ISODate("2026-03-03T12:30:00Z")
+  },
+  {
+    "code": "522900",
+    "description": "OTRAS ACTIVIDADES ANEXAS AL TRANSPORTE",
+    "category": "Primera",
+    "isVatSubject": true,
+    "startDate": ISODate("2005-06-15T00:00:00Z"),
+    "lastUpdatedAt": ISODate("2026-02-15T00:00:00Z"),
+    "dataSource": "consulta_automatizacion",
+    "extractedAt": ISODate("2026-03-03T12:30:00Z")
+  }
+] en la tabla RT_carrier para todos los registros que estan en la tabla y que tbn admita una lista de rut o id_tax  en caso que se deban procesar otro registros
+
+
+
+RT_carrier tienen esta estructura
+
+{
+  "_id": {
+    "$oid": "66c3e1a0aabcef4e4a7f9225"
+  },
+  "tax_id": "13.090.093-3",
+  "account_bank": "BANCO FALABELLA",
+  "account_email": "victorparadamartinez@yahoo.es",
+  "account_number": "15130257960",
+  "account_type": "Cuenta Corriente",
+  "address": "Calamar 8859, La Cisterna, Chile",
+  "email": "victorparadamartinez@yahoo.es",
+  "enabled": true,
+  "legal_address": "Calamar 8859, La Cisterna, Chile",
+  "legal_name": "VICTOR",
+  "legal_last_name": "PARADA MARTINEZ",
+  "legal_nationality": "Chilena",
+  "legal_tax_id": "13.090.093-3",
+  "name": "VICTOR RAMON PARADA MARTINEZ",
+  "phone": "+56985299206",
+  "status": "active",
+  "tenant": {
+    "$oid": "66193d29d9c3ffa531f84a87"
+  },
+  "generalPercent": 57.142857142857146,
+  "leaderCheck": false,
+  "leader_address": "",
+  "leader_email": "",
+  "leader_name": "",
+  "leader_phone": "",
+  "leader_tax_id": "",
+  "percents": [
+    100,
+    85.71428571428571,
+    0,
+    100,
+    0,
+    0
+  ],
+  "updated": {
+    "user": {
+      "id": {
+        "$oid": "67ee8cf6b02f3c7ff4af6592"
+      },
+      "email": "ccerda@rocktruck.com",
+      "role": "onboarding"
+    },
+    "date": {
+      "$date": "2025-09-01T10:15:41.000Z"
+    }
+  },
+  "members": [],,
+  "city": "Santiago",
+  "commune": "La Cisterna",
+  "country": "Chile",
+  "origin": "onboarding",
+  "payment_document_type": "",
+  "region": "Región Metropolitana",
+  "zones": [
+    {
+      "id": {
+        "$oid": "67ddc0d8cd5ceccbb7f01e7b"
+      },
+      "name": "Metropolitana de Santiago",
+      "region_number": "XIII"
+    }
+  ],
+  "activity": "",
+  "activity_other": "",
+  "type": "legal_entity",
+  "account_name": "VICTOR RAMON PARADA MARTINEZ",
+  "account_tax_id": "13.090.093-3"
+}
+
+ Lógica 
+ disparar Automatización SII (Oxylabs) para obtener los giros y data cada registro.
+
+ pero no se como llebar los log de los rut que si fueron actualizados, los que no se encontraron en sii, los que sii presento fallo, los que no se procesaron tofdo, porque son as de 1000 y necesito saber porque no se procesaron los que no se logren procesar, no se si en una coleccion nueva , pensando que este proceso de carga inicial es una vez pero luego habran actualizaciones periodicas, por lo que hay que distinguir si es carga o despues cuando haga y procese las actualizaciones
+
+ necesito que sigas la estructura de otro proyecto que tengo ya que necesito que sea por cloud pero la automatizacion del scrapping es por mv para que no bloquee los ip
+
+
+
+

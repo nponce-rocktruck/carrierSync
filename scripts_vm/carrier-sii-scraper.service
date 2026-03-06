@@ -1,0 +1,19 @@
+# Servicio systemd para CarrierSync VM - Scraper SII (producción)
+# Instalar: sudo cp carrier-sii-scraper.service /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable carrier-sii-scraper && sudo systemctl start carrier-sii-scraper
+
+[Unit]
+Description=CarrierSync VM - SII Giros Scraper API (prod)
+After=network.target
+
+[Service]
+Type=simple
+User=carriersync
+WorkingDirectory=/opt/carriersync
+Environment=PORT=8080
+ExecStart=/opt/carriersync/venv/bin/uvicorn vm_services.sii_scraper_api:app --host 0.0.0.0 --port 8080
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

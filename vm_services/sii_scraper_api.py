@@ -1,0 +1,325 @@
+"""
+API de scraping SII para VM.
+Expone POST /api/v1/sii/giros con {"rut": "..."} y devuelve las actividades económicas.
+Ejecutar en VM para no bloquear IPs (usar Oxylabs u otro proxy si se desea).
+
+Limpieza de espacio: cada sesión de Chrome usa un directorio temporal que se borra
+al terminar; además se ejecuta limpieza periódica para evitar llenar el disco
+(carga inicial 1000 RUTs, actualizaciones, consultas individuales).
+"""
+
+import os
+import re
+import time
+import shutil
+import logging
+import threading
+from pathlib import Path
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+from uuid import uuid4
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# Selenium/Chrome - en VM
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from webdriver_manager.chrome import ChromeDriverManager
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+    logger.warning("Selenium no disponible; instalar requirements_vm.txt en la VM")
+
+app = FastAPI(title="CarrierSync VM - SII Scraper", version="1.0.0")
+
+OXY_USER = os.getenv("OXY_USER", "")
+OXY_PASS = os.getenv("OXY_PASS", "")
+OXY_HOST = os.getenv("OXY_HOST", "unblock.oxylabs.io")
+OXY_PORT = os.getenv("OXY_PORT", "60000")
+
+# --- Limpieza de espacio en disco (evitar llenar /tmp con 1000+ RUTs) ---
+# Directorio base para temporales de Chrome; se borra cada sesión y se hace limpieza periódica
+VM_TEMP_BASE = Path(os.getenv("VM_TEMP_BASE_DIR", "/tmp/carriersync_scraper"))
+# Borrar directorios de sesión más viejos que N minutos (por si un run crasheó sin limpiar)
+VM_CLEANUP_MAX_AGE_MINUTES = int(os.getenv("VM_CLEANUP_MAX_AGE_MINUTES", "15"))
+# Ejecutar limpieza de residuos cada N requests
+VM_CLEANUP_EVERY_N_REQUESTS = int(os.getenv("VM_CLEANUP_EVERY_N_REQUESTS", "50"))
+
+_request_count = 0
+_request_count_lock = threading.Lock()
+
+
+class GirosRequest(BaseModel):
+    rut: str
+
+
+def _normalizar_rut(rut: str) -> str:
+    """Quita puntos y deja formato 12345678-9."""
+    if not rut:
+        return ""
+    s = rut.strip().upper().replace(".", "").replace(" ", "")
+    if "-" not in s and len(s) >= 2 and s[-1] in "0123456789K":
+        return f"{s[:-1]}-{s[-1]}"
+    return s
+
+
+def _parsear_fecha_sii(texto: str) -> Optional[datetime]:
+    """Intenta parsear fecha tipo dd-mm-yyyy o similar."""
+    if not texto or not texto.strip():
+        return None
+    texto = texto.strip()
+    # dd-mm-yyyy o dd/mm/yyyy
+    m = re.match(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", texto)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return datetime(y, mo, d)
+        except ValueError:
+            return None
+    return None
+
+
+def _cleanup_old_sessions() -> int:
+    """
+    Borra directorios de sesión Chrome en VM_TEMP_BASE más viejos que VM_CLEANUP_MAX_AGE_MINUTES.
+    Útil cuando un run crasheó sin hacer cleanup. Devuelve cantidad de directorios eliminados.
+    """
+    if not VM_TEMP_BASE.exists():
+        return 0
+    now = time.time()
+    max_age_sec = VM_CLEANUP_MAX_AGE_MINUTES * 60
+    removed = 0
+    try:
+        for p in VM_TEMP_BASE.iterdir():
+            if not p.is_dir():
+                continue
+            try:
+                age = now - p.stat().st_mtime
+                if age > max_age_sec:
+                    shutil.rmtree(p, ignore_errors=True)
+                    removed += 1
+                    logger.info("Limpieza VM: borrado sesión antigua %s", p.name)
+            except OSError as e:
+                logger.warning("No se pudo borrar %s: %s", p, e)
+    except OSError as e:
+        logger.warning("Error listando %s: %s", VM_TEMP_BASE, e)
+    return removed
+
+
+def _maybe_run_periodic_cleanup() -> None:
+    """Cada VM_CLEANUP_EVERY_N_REQUESTS requests ejecuta limpieza de sesiones viejas (en background)."""
+    global _request_count
+    with _request_count_lock:
+        _request_count += 1
+        n = _request_count
+    if n % VM_CLEANUP_EVERY_N_REQUESTS == 0:
+        try:
+            removed = _cleanup_old_sessions()
+            if removed > 0:
+                logger.info("Limpieza periódica VM: %d directorios de sesión eliminados", removed)
+        except Exception as e:
+            logger.warning("Error en limpieza periódica VM: %s", e)
+
+
+def _crear_driver(headless: bool = True):
+    """
+    Crea el driver de Chrome usando un directorio temporal propio que debe borrarse después.
+    Returns: (driver, temp_dir_path) o (None, None). Quien llama debe hacer driver.quit() y luego
+    shutil.rmtree(temp_dir_path, ignore_errors=True).
+    """
+    if not SELENIUM_AVAILABLE:
+        return None, None
+    VM_TEMP_BASE.mkdir(parents=True, exist_ok=True)
+    session_dir = VM_TEMP_BASE / f"chrome_{uuid4().hex[:12]}"
+    try:
+        session_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.error("No se pudo crear directorio de sesión %s: %s", session_dir, e)
+        return None, None
+
+    options = Options()
+    options.add_experimental_option("excludeSwitches", ["enable-logging"])
+    if headless:
+        options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    # Reducir uso de disco: user-data-dir en nuestro temp y desactivar cachés
+    options.add_argument(f"--user-data-dir={session_dir}")
+    options.add_argument("--disk-cache-size=0")
+    options.add_argument("--disable-application-cache")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    if OXY_USER and OXY_PASS:
+        options.add_argument(f"--proxy-server=http://{OXY_HOST}:{OXY_PORT}")
+    try:
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
+        return driver, session_dir
+    except Exception as e:
+        logger.exception("Error creando Chrome driver: %s", e)
+        try:
+            shutil.rmtree(session_dir, ignore_errors=True)
+        except Exception:
+            pass
+        return None, None
+
+
+def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
+    """
+    Abre SII, ingresa RUT, extrae tabla de actividades económicas.
+    Usa un directorio temporal por sesión que se borra al terminar para no llenar el disco.
+    Returns: {"success", "activities", "not_found", "error"}
+    """
+    rut = _normalizar_rut(rut)
+    if not rut:
+        return {"success": False, "activities": [], "not_found": False, "error": "RUT vacío o inválido"}
+
+    _maybe_run_periodic_cleanup()
+
+    driver, session_dir = _crear_driver(headless=True)
+    if not driver:
+        return {"success": False, "activities": [], "not_found": False, "error": "Driver Chrome no disponible"}
+
+    activities = []
+    not_found = False
+    error_msg = None
+
+    try:
+        driver.get("https://www2.sii.cl/stc/noauthz")
+        wait = WebDriverWait(driver, 15)
+
+        # Ingresar RUT
+        input_rut = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input.rut-form")))
+        input_rut.clear()
+        input_rut.send_keys(rut)
+        time.sleep(0.5)
+
+        # Consultar Situación Tributaria
+        btn_consultar = wait.until(
+            EC.element_to_be_clickable((By.XPATH, "//input[@value='Consultar Situación Tributaria']"))
+        )
+        driver.execute_script("arguments[0].scrollIntoView(true);", btn_consultar)
+        driver.execute_script("arguments[0].click();", btn_consultar)
+        time.sleep(1)
+
+        # Botón desplegar actividades
+        try:
+            btn_desplegar = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.open-btn")))
+            driver.execute_script("arguments[0].click();", btn_desplegar)
+        except Exception:
+            # Puede no haber actividades
+            not_found = True
+            return {"success": True, "activities": [], "not_found": not_found, "error": None}
+
+        wait.until(EC.visibility_of_element_located((By.ID, "DataTables_Table_0")))
+        time.sleep(1)
+
+        filas = driver.find_elements(By.CSS_SELECTOR, "#DataTables_Table_0 tbody tr")
+        for fila in filas:
+            columnas = fila.find_elements(By.TAG_NAME, "td")
+            if len(columnas) >= 6:
+                descripcion = columnas[1].text.strip()
+                codigo = columnas[2].text.strip()
+                categoria = columnas[3].text.strip()
+                afecta_iva = columnas[4].text.strip().upper()
+                fecha_texto = columnas[5].text.strip()
+                activities.append({
+                    "code": codigo,
+                    "description": descripcion,
+                    "category": categoria,
+                    "isVatSubject": "SI" in afecta_iva or "SÍ" in afecta_iva,
+                    "fecha": fecha_texto,
+                    "startDate": _parsear_fecha_sii(fecha_texto),
+                    "lastUpdatedAt": datetime.utcnow(),
+                })
+
+    except Exception as e:
+        logger.exception("Error extrayendo giros para %s: %s", rut, e)
+        error_msg = str(e)
+        not_found = "no se encontró" in str(e).lower() or "not found" in str(e).lower()
+    finally:
+        try:
+            driver.quit()
+        except Exception as e:
+            logger.warning("Error al cerrar driver: %s", e)
+        # Liberar espacio: borrar directorio de sesión de Chrome (caché, user data, etc.)
+        if session_dir and session_dir.exists():
+            try:
+                shutil.rmtree(session_dir, ignore_errors=True)
+            except Exception as e:
+                logger.warning("No se pudo borrar sesión %s: %s", session_dir, e)
+
+    return {
+        "success": error_msg is None,
+        "activities": activities,
+        "not_found": not_found,
+        "error": error_msg,
+    }
+
+
+@app.on_event("startup")
+def startup_cleanup():
+    """Al iniciar la API, borrar sesiones Chrome viejas (p. ej. de un reinicio tras crash)."""
+    try:
+        removed = _cleanup_old_sessions()
+        if removed > 0:
+            logger.info("Limpieza al inicio: %d directorios de sesión eliminados", removed)
+        VM_TEMP_BASE.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.warning("Limpieza al inicio: %s", e)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "service": "sii-scraper-vm", "selenium": SELENIUM_AVAILABLE}
+
+
+@app.post("/api/v1/cleanup")
+async def cleanup_disk():
+    """
+    Fuerza limpieza de directorios de sesión antiguos (liberar espacio).
+    Útil si el disco se llenó o quieres liberar sin esperar al próximo ciclo.
+    """
+    try:
+        removed = _cleanup_old_sessions()
+        return {"ok": True, "removed_sessions": removed, "message": f"Eliminados {removed} directorios de sesión"}
+    except Exception as e:
+        logger.exception("Error en cleanup manual: %s", e)
+        return {"ok": False, "removed_sessions": 0, "error": str(e)}
+
+
+@app.post("/api/v1/sii/giros")
+async def obtener_giros(body: GirosRequest) -> Dict[str, Any]:
+    """
+    Consulta el SII por RUT y devuelve la lista de actividades económicas (giros).
+    Ejecuta el scraping en esta VM para no exponer la IP de Cloud Run.
+    """
+    rut = (body.rut or "").strip()
+    if not rut:
+        raise HTTPException(status_code=400, detail="rut es requerido")
+
+    result = _extraer_giros_sii(rut)
+    return {
+        "rut": _normalizar_rut(rut),
+        "activities": result["activities"],
+        "economicActivities": result["activities"],
+        "not_found": result["not_found"],
+        "error": result.get("error"),
+        "success": result["success"],
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)

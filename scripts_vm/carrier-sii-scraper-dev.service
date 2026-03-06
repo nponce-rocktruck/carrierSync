@@ -1,0 +1,18 @@
+# Servicio systemd OPCIONAL: solo si quisieras un puerto distinto para dev (ej. 8081).
+# Por defecto dev y prod usan la misma VM y el mismo puerto (8080); no hace falta este servicio.
+
+[Unit]
+Description=CarrierSync VM - SII Giros Scraper API (dev, opcional)
+After=network.target
+
+[Service]
+Type=simple
+User=carriersync
+WorkingDirectory=/opt/carriersync
+Environment=PORT=8081
+ExecStart=/opt/carriersync/venv/bin/uvicorn vm_services.sii_scraper_api:app --host 0.0.0.0 --port 8081
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

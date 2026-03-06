@@ -1,0 +1,38 @@
+# CarrierSync API - Dependencias Cloud Run
+
+# FastAPI y servidor
+fastapi>=0.115.0
+starlette>=0.37.0,<1.0.0
+uvicorn[standard]==0.25.0
+python-multipart==0.0.6
+
+# Cloud Functions adapter (Cloud Functions Gen2)
+functions-framework[fastapi]>=3.9.1
+vellox==0.1.3
+
+# Base de datos MongoDB
+pymongo==4.6.0
+motor==3.3.2
+
+# HTTP requests
+requests==2.31.0
+aiohttp==3.9.1
+
+# Validación de datos
+pydantic==2.5.0
+pydantic[email]==2.5.0
+
+# Logging y configuración
+python-dotenv==1.0.0
+
+# Utilidades
+python-dateutil==2.8.2
+pytz==2023.3
+
+# Desarrollo y testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+httpx==0.25.2
+
+# CORS
+fastapi-cors==0.0.6

@@ -1,0 +1,33 @@
+# CarrierSync - Desarrollo local
+# La API corre en Cloud Run en prod; la VM con el scraper SII se configura aparte.
+# Uso: docker-compose up -d
+# Variables en .env o env.dev.yaml (MONGODB_URL, etc.)
+
+version: "3.8"
+
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - MONGODB_URL=${MONGODB_URL:-mongodb://mongo:27017}
+      - MONGODB_DATABASE=${MONGODB_DATABASE:-Samanta}
+      - VM_SII_SCRAPER_URL=${VM_SII_SCRAPER_URL:-}
+      - ENVIRONMENT=dev
+      - LOG_LEVEL=DEBUG
+    # Para probar con MongoDB local (opcional):
+    # depends_on:
+    #   - mongo
+
+  # Opcional: MongoDB local para desarrollo
+  # mongo:
+  #   image: mongo:6
+  #   ports:
+  #     - "27017:27017"
+  #   volumes:
+  #     - mongo_data:/data/db
+
+# volumes:
+#   mongo_data:
