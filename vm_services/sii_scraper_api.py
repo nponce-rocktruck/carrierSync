@@ -53,12 +53,18 @@ HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
 PROXY_USER = os.getenv("PROXY_USER", "")
 PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "")
 
+# Desactivar proxy para pruebas (SII_SCRAPER_USE_PROXY=false en la VM)
+SII_SCRAPER_USE_PROXY = os.getenv("SII_SCRAPER_USE_PROXY", "true").lower() not in ("false", "0", "no")
+
 
 def _get_proxy_config() -> Optional[Dict[str, str]]:
     """
     Devuelve configuración de proxy para uso con extensión Chrome.
     Prioridad: OXY_* > HTTP_PROXY + PROXY_USER/PROXY_PASSWORD.
+    Si SII_SCRAPER_USE_PROXY=false, no usa proxy (para probar desde la VM sin proxy).
     """
+    if not SII_SCRAPER_USE_PROXY:
+        return None
     if OXY_USER and OXY_PASS and OXY_HOST and OXY_PORT:
         return {"host": OXY_HOST, "port": OXY_PORT, "username": OXY_USER, "password": OXY_PASS}
     if HTTP_PROXY and PROXY_USER and PROXY_PASSWORD:
@@ -259,6 +265,8 @@ def _crear_driver(headless: bool = True):
             logger.info("[SII] Proxy residencial configurado (extensión auth): %s:%s", proxy_cfg["host"], proxy_cfg["port"])
         except Exception as e:
             logger.warning("[SII] No se pudo crear extensión de proxy, continuando sin proxy: %s", e)
+    elif not SII_SCRAPER_USE_PROXY:
+        logger.info("[SII] Proxy desactivado (SII_SCRAPER_USE_PROXY=false)")
     try:
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
@@ -371,6 +379,18 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
             "[SII] Error extrayendo giros para %s: %s - %s (detalle: %s)",
             rut, error_type, error_detail, e.args
         )
+        # En timeout de la primera carga, guardar HTML y URL para ver qué recibió Chrome (proxy/página)
+        if error_type == "TimeoutException" and driver:
+            try:
+                debug_dir = VM_TEMP_BASE / "debug"
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                path_html = debug_dir / "sii_last_timeout.html"
+                path_url = debug_dir / "sii_last_timeout_url.txt"
+                path_html.write_text(driver.page_source or "", encoding="utf-8", errors="replace")
+                path_url.write_text(driver.current_url or "", encoding="utf-8")
+                logger.warning("[SII] Debug: guardado %s y %s (revisar qué cargó Chrome)", path_html, path_url)
+            except Exception as ex:
+                logger.warning("[SII] No se pudo guardar debug: %s", ex)
         error_msg = str(e) or f"{error_type}: {error_detail}"
         not_found = "no se encontró" in str(e).lower() or "not found" in str(e).lower()
     finally:
