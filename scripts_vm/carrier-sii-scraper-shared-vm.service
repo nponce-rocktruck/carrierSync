@@ -15,6 +15,11 @@ Group=pc
 WorkingDirectory=/home/pc/carrierSync
 Environment="PATH=/home/pc/carrierSync/venv/bin:/usr/local/bin:/usr/bin:/bin"
 Environment=PORT=8082
+# Proxy residencial Oxylabs (mismas credenciales que VM verificación DT)
+Environment="OXY_USER=conirarra_FyqF8"
+Environment="OXY_PASS=Clemente_2011"
+Environment="OXY_HOST=unblock.oxylabs.io"
+Environment="OXY_PORT=60000"
 ExecStart=/home/pc/carrierSync/venv/bin/uvicorn vm_services.sii_scraper_api:app --host 0.0.0.0 --port 8082
 Restart=always
 RestartSec=10

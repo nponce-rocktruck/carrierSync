@@ -2,6 +2,7 @@
 .env
 .env.local
 .env.production
+env.proxy
 env.yaml
 *.env.yaml
 env.cloud-functions.yaml

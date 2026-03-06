@@ -14,6 +14,8 @@ import time
 import shutil
 import logging
 import threading
+import zipfile
+import json
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -45,6 +47,74 @@ OXY_USER = os.getenv("OXY_USER", "")
 OXY_PASS = os.getenv("OXY_PASS", "")
 OXY_HOST = os.getenv("OXY_HOST", "unblock.oxylabs.io")
 OXY_PORT = os.getenv("OXY_PORT", "60000")
+
+# Proxy alternativo por env (compatible con ProxyManager: HTTP_PROXY + PROXY_USER / PROXY_PASSWORD)
+HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
+PROXY_USER = os.getenv("PROXY_USER", "")
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "")
+
+
+def _get_proxy_config() -> Optional[Dict[str, str]]:
+    """
+    Devuelve configuración de proxy para uso con extensión Chrome.
+    Prioridad: OXY_* > HTTP_PROXY + PROXY_USER/PROXY_PASSWORD.
+    """
+    if OXY_USER and OXY_PASS and OXY_HOST and OXY_PORT:
+        return {"host": OXY_HOST, "port": OXY_PORT, "username": OXY_USER, "password": OXY_PASS}
+    if HTTP_PROXY and PROXY_USER and PROXY_PASSWORD:
+        from urllib.parse import urlparse
+        parsed = urlparse(HTTP_PROXY if "://" in HTTP_PROXY else "http://" + HTTP_PROXY)
+        host = parsed.hostname or ""
+        port = str(parsed.port or "80")
+        if host:
+            return {"host": host, "port": port, "username": PROXY_USER, "password": PROXY_PASSWORD}
+    return None
+
+
+def _crear_proxy_auth_extension(proxy_host: str, proxy_port: str, proxy_user: str, proxy_pass: str, out_dir: Path) -> str:
+    """
+    Crea una extensión de Chrome para autenticación de proxy (Oxylabs u otro proxy residencial).
+    Chrome no soporta user/pass en --proxy-server; la extensión responde a onAuthRequired.
+    """
+    plugin_path = out_dir / "proxy_auth_plugin.zip"
+    manifest_json = json.dumps({
+        "version": "1.0.0",
+        "manifest_version": 2,
+        "name": "Oxylabs Proxy",
+        "permissions": ["proxy", "tabs", "unlimitedStorage", "storage", "<all_urls>", "webRequest", "webRequestBlocking"],
+        "background": {"scripts": ["background.js"]},
+        "minimum_chrome_version": "22.0.0"
+    })
+    background_js = f"""
+    var config = {{
+        mode: "fixed_servers",
+        rules: {{
+            singleProxy: {{
+                scheme: "http",
+                host: "{proxy_host}",
+                port: parseInt({proxy_port})
+            }},
+            bypassList: ["localhost"]
+        }}
+    }};
+    chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
+    chrome.webRequest.onAuthRequired.addListener(
+        function(details) {{
+            return {{
+                authCredentials: {{
+                    username: "{proxy_user}",
+                    password: "{proxy_pass}"
+                }}
+            }};
+        }},
+        {{urls: ["<all_urls>"]}},
+        ["blocking"]
+    );
+    """
+    with zipfile.ZipFile(plugin_path, "w", zipfile.ZIP_DEFLATED) as zp:
+        zp.writestr("manifest.json", manifest_json)
+        zp.writestr("background.js", background_js)
+    return str(plugin_path)
 
 # --- Limpieza de espacio en disco (evitar llenar /tmp con 1000+ RUTs) ---
 # Directorio base para temporales de Chrome; se borra cada sesión y se hace limpieza periódica
@@ -174,8 +244,21 @@ def _crear_driver(headless: bool = True):
     options.add_argument("--disable-application-cache")
     options.add_argument("--no-first-run")
     options.add_argument("--no-default-browser-check")
-    if OXY_USER and OXY_PASS:
-        options.add_argument(f"--proxy-server=http://{OXY_HOST}:{OXY_PORT}")
+    proxy_cfg = _get_proxy_config()
+    if proxy_cfg:
+        # Proxy residencial (Oxylabs, etc.) requiere autenticación; Chrome no la soporta por argumento.
+        # Cargamos una extensión que inyecta user/pass en onAuthRequired (igual que gestion_documental).
+        try:
+            ext_path = _crear_proxy_auth_extension(
+                proxy_cfg["host"], proxy_cfg["port"],
+                proxy_cfg["username"], proxy_cfg["password"],
+                session_dir
+            )
+            options.add_argument(f"--proxy-server=http://{proxy_cfg['host']}:{proxy_cfg['port']}")
+            options.add_argument(f"--load-extension={ext_path}")
+            logger.info("[SII] Proxy residencial configurado (extensión auth): %s:%s", proxy_cfg["host"], proxy_cfg["port"])
+        except Exception as e:
+            logger.warning("[SII] No se pudo crear extensión de proxy, continuando sin proxy: %s", e)
     try:
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
@@ -197,12 +280,17 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
     """
     rut = _normalizar_rut(rut)
     if not rut:
+        logger.info("[SII] RUT vacío o inválido, rechazando")
         return {"success": False, "activities": [], "not_found": False, "error": "RUT vacío o inválido"}
+
+    rut_para_sii = _rut_con_puntos(rut)
+    logger.info("[SII] Inicio extracción RUT normalizado=%s, enviando al formulario=%s", rut, rut_para_sii)
 
     _maybe_run_periodic_cleanup()
 
     driver, session_dir = _crear_driver(headless=True)
     if not driver:
+        logger.error("[SII] No se pudo crear el driver Chrome")
         return {"success": False, "activities": [], "not_found": False, "error": "Driver Chrome no disponible"}
 
     activities = []
@@ -211,13 +299,13 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
 
     try:
         driver.get("https://www2.sii.cl/stc/noauthz")
-        wait = WebDriverWait(driver, 15)
+        wait = WebDriverWait(driver, 20)
 
         # Ingresar RUT en formato que espera el SII: 17.807.161-0 (con puntos de miles)
         input_rut = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input.rut-form")))
         input_rut.clear()
-        rut_para_sii = _rut_con_puntos(rut)
         input_rut.send_keys(rut_para_sii)
+        logger.info("[SII] RUT escrito en input: %s", rut_para_sii)
         time.sleep(0.5)
 
         # Consultar Situación Tributaria
@@ -226,21 +314,27 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
         )
         driver.execute_script("arguments[0].scrollIntoView(true);", btn_consultar)
         driver.execute_script("arguments[0].click();", btn_consultar)
-        time.sleep(1)
+        logger.info("[SII] Click en Consultar Situación Tributaria, esperando carga...")
+        time.sleep(2)
 
-        # Botón desplegar actividades
+        # Botón desplegar actividades (en headless puede tardar más)
         try:
-            btn_desplegar = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.open-btn")))
+            btn_desplegar = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "button.open-btn"))
+            )
             driver.execute_script("arguments[0].click();", btn_desplegar)
-        except Exception:
-            # Puede no haber actividades
+            logger.info("[SII] Botón desplegar actividades encontrado y clickeado")
+        except Exception as e:
+            # Puede no haber actividades para este RUT
+            logger.warning("[SII] No se encontró botón open-btn para RUT %s (posible sin actividades): %s", rut, e)
             not_found = True
             return {"success": True, "activities": [], "not_found": not_found, "error": None}
 
         wait.until(EC.visibility_of_element_located((By.ID, "DataTables_Table_0")))
-        time.sleep(1)
+        time.sleep(1.5)
 
         filas = driver.find_elements(By.CSS_SELECTOR, "#DataTables_Table_0 tbody tr")
+        logger.info("[SII] Tabla DataTables_Table_0 visible, filas encontradas: %d", len(filas))
         for fila in filas:
             columnas = fila.find_elements(By.TAG_NAME, "td")
             if len(columnas) >= 6:
@@ -259,8 +353,15 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
                     "lastUpdatedAt": datetime.utcnow(),
                 })
 
+        if not activities and filas:
+            logger.warning("[SII] RUT %s: hay %d filas pero ninguna con >=6 columnas (revisar estructura tabla)", rut, len(filas))
+        elif not activities:
+            logger.warning("[SII] RUT %s: tabla visible pero 0 filas de actividades", rut)
+        else:
+            logger.info("[SII] RUT %s: extraídas %d actividades correctamente", rut, len(activities))
+
     except Exception as e:
-        logger.exception("Error extrayendo giros para %s: %s", rut, e)
+        logger.exception("[SII] Error extrayendo giros para %s: %s", rut, e)
         error_msg = str(e)
         not_found = "no se encontró" in str(e).lower() or "not found" in str(e).lower()
     finally:
@@ -275,6 +376,7 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
             except Exception as e:
                 logger.warning("No se pudo borrar sesión %s: %s", session_dir, e)
 
+    logger.info("[SII] RUT %s resultado: success=%s, activities=%d, not_found=%s, error=%s", rut, error_msg is None, len(activities), not_found, error_msg)
     return {
         "success": error_msg is None,
         "activities": activities,
@@ -324,7 +426,9 @@ async def obtener_giros(body: GirosRequest) -> Dict[str, Any]:
     if not rut:
         raise HTTPException(status_code=400, detail="rut es requerido")
 
+    logger.info("[SII] POST /giros recibido RUT=%s", rut)
     result = _extraer_giros_sii(rut)
+    logger.info("[SII] POST /giros RUT=%s -> success=%s activities=%d not_found=%s", rut, result["success"], len(result.get("activities", [])), result.get("not_found"))
     return {
         "rut": _normalizar_rut(rut),
         "activities": result["activities"],

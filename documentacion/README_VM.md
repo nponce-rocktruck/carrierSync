@@ -41,7 +41,8 @@ Si dice que la regla ya existe, sigue al siguiente paso.
 ### 2.2 En la PC – Conectarte a la VM
 
 ```powershell
-gcloud compute ssh mv-2-southamerica --zone=southamerica-west1-b --project=gestiondocumental-473815```
+gcloud compute ssh mv-2-southamerica --zone=southamerica-west1-b --project=gestiondocumental-473815
+```
 
 
 Cuando veas algo como `pc@mv-2-southamerica:~$` ya estás **dentro de la VM**. Los siguientes comandos son en la VM.
@@ -80,6 +81,19 @@ git pull
 ```
 
 ---
+cd ~/carrierSync
+git pull
+./venv/bin/pip install -r requirements_vm.txt -q
+sudo systemctl restart carrier-sii-scraper
+curl -s http://localhost:8082/health
+
+Acción	Comando
+Ver estado	sudo systemctl status carrier-sii-scraper
+Reiniciar	sudo systemctl restart carrier-sii-scraper
+Ver logs en vivo	sudo journalctl -u carrier-sii-scraper -f
+Parar / arrancar	sudo systemctl stop carrier-sii-scraper / sudo systemctl start carrier-sii-scraper
+
+--- 
 
 ### 2.5 En la VM – Ejecutar el script (instala todo)
 
@@ -157,7 +171,7 @@ Guarda los dos archivos.
 # Estado del servicio
 sudo systemctl status carrier-sii-scraper
 
-# Ver logs en tiempo real
+# Ver logs en tiempo real (recomendado para depurar)
 sudo journalctl -u carrier-sii-scraper -f
 
 # Ver últimas 100 líneas
@@ -170,6 +184,26 @@ sudo systemctl restart carrier-sii-scraper
 sudo systemctl stop carrier-sii-scraper
 sudo systemctl start carrier-sii-scraper
 ```
+
+### Ver logs para depurar “no encontrado en SII”
+
+Si los RUTs salen como *not_found_sii* o *Sin actividades en respuesta SII*, en la VM puedes seguir qué hace el scraper:
+
+1. Conéctate por SSH y abre los logs en vivo:
+   ```bash
+   sudo journalctl -u carrier-sii-scraper -f
+   ```
+2. Desde otra ventana (o desde tu PC) lanza una carga de giros para el RUT que falla.
+3. En los logs verás líneas con prefijo `[SII]`:
+   - `[SII] POST /giros recibido RUT=...` — RUT que llegó al endpoint.
+   - `[SII] Inicio extracción RUT normalizado=..., enviando al formulario=...` — Formato enviado al input del SII (debe ser tipo 17.807.161-0).
+   - `[SII] RUT escrito en input` — Confirmación de que se escribió en el campo.
+   - `[SII] Click en Consultar Situación Tributaria` — Se hizo click en consultar.
+   - `[SII] No se encontró botón open-btn` — La página no mostró el botón de actividades (RUT sin datos o página distinta).
+   - `[SII] Tabla DataTables_Table_0 visible, filas encontradas: N` — Cuántas filas se leyeron.
+   - `[SII] RUT ... resultado: success=..., activities=N` — Resumen final.
+
+Si aparece *No se encontró botón open-btn*: el SII no está mostrando actividades para ese RUT (o la página tardó más de 10 s). Si aparece *filas encontradas: 0*: la tabla está vacía. Si hay filas pero *activities=0*: la estructura de columnas puede haber cambiado (revisar selectores en `vm_services/sii_scraper_api.py`).
 
 ---
 
@@ -195,6 +229,34 @@ Comprobar: `curl -s http://localhost:8082/health`.
 - **Desde la PC “connection refused” al 8082:** Comprueba el firewall (paso 2.1) y en la VM: `sudo systemctl status carrier-sii-scraper` (debe decir “active (running)”).
 - **En /health sale "selenium": false:** Chromium no está bien instalado o no se instalaron las dependencias del venv; repite el paso de Chromium y `./venv/bin/pip install -r requirements_vm.txt`.
 - **Disco lleno en la VM:** El scraper limpia temporales; además puedes llamar a `POST http://34.176.102.209:8082/api/v1/cleanup` para forzar limpieza.
+- **El SII bloquea o no devuelve datos:** Configura proxy residencial (Oxylabs) como en gestion_documental; ver sección "Configurar proxy residencial" más abajo.
+
+---
+
+## 7.1 Configurar proxy residencial (Oxylabs)
+
+Si el SII bloquea la IP de la VM, usa el mismo proxy residencial que en gestion_documental.
+
+**Opción A – Archivo de credenciales (recomendado, no sube secretos al repo)**
+
+1. En la VM: `cd ~/carrierSync`, `cp env.proxy.example env.proxy`, `nano env.proxy` y rellena `OXY_USER` y `OXY_PASS`.
+2. `sudo systemctl edit --full carrier-sii-scraper` y en `[Service]` añade una línea: `EnvironmentFile=/home/pc/carrierSync/env.proxy`
+3. `sudo systemctl daemon-reload && sudo systemctl restart carrier-sii-scraper`
+
+El archivo `env.proxy` no se sube al repo (está en .gitignore). Si reclonas, vuelve a crear `env.proxy` desde `env.proxy.example`.
+
+**Opción B – Variables en systemd**
+
+En `systemctl edit --full carrier-sii-scraper`, bajo `[Service]` añade:
+
+```ini
+Environment=OXY_USER=tu_usuario_oxylabs
+Environment=OXY_PASS=tu_password_oxylabs
+Environment=OXY_HOST=unblock.oxylabs.io
+Environment=OXY_PORT=60000
+```
+
+Luego: `sudo systemctl daemon-reload && sudo systemctl restart carrier-sii-scraper`. En logs: `[SII] Proxy residencial configurado (extensión auth): ...`.
 
 ---
 
