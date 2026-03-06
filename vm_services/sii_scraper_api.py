@@ -61,7 +61,8 @@ SII_SCRAPER_USE_PROXY = os.getenv("SII_SCRAPER_USE_PROXY", "true").lower() not i
 # 2Captcha (misma API key que gestion_documental / verification_api)
 API_KEY_2CAPTCHA = os.getenv("API_KEY_2CAPTCHA", "e716e4f00d5e2225bcd8ed2a04981fe3")
 SII_RECAPTCHA_SITEKEY = os.getenv("SII_RECAPTCHA_SITEKEY", "").strip()
-SII_CONSULTA_URL = "https://www2.sii.cl/stc/noauthz"
+# reCAPTCHA solo se carga en la URL con .html (no en /noauthz sin extensión)
+SII_CONSULTA_URL = "https://www2.sii.cl/stc/noauthz.html"
 # Acción para reCAPTCHA v3 Enterprise (debe coincidir con la que usa el SII al llamar execute; la API usa reAction: consultaSTC)
 SII_RECAPTCHA_PAGE_ACTION = os.getenv("SII_RECAPTCHA_PAGE_ACTION", "consultaSTC")
 
@@ -286,6 +287,27 @@ def _obtener_sitekey_sii(driver) -> Optional[str]:
     if SII_RECAPTCHA_SITEKEY:
         return SII_RECAPTCHA_SITEKEY
     try:
+        # Prioridad 1: sitekey con el que se cargó el script (render= en enterprise.js o api.js)
+        sitekey = driver.execute_script(
+            """
+            var scripts = document.getElementsByTagName('script');
+            var enterpriseKey = null;
+            var anyKey = null;
+            for (var i = 0; i < scripts.length; i++) {
+                var src = (scripts[i].src || '').toString();
+                if (src.indexOf('recaptcha') === -1 || src.indexOf('render=') === -1) continue;
+                var m = src.match(/render=([^&]+)/);
+                if (m && m[1]) {
+                    if (src.indexOf('enterprise') !== -1) return m[1];
+                    if (!anyKey) anyKey = m[1];
+                }
+            }
+            return anyKey;
+            """
+        )
+        if (sitekey or "").strip():
+            return (sitekey or "").strip()
+        # Prioridad 2: data-sitekey en el DOM
         sitekey = driver.execute_script(
             """
             var el = document.querySelector('[data-sitekey]');
@@ -326,13 +348,24 @@ def _obtener_token_desde_navegador(driver, sitekey: str) -> Optional[str]:
             var sitekey = arguments[0];
             var action = arguments[1];
             var callback = arguments[arguments.length - 1];
-            if (typeof grecaptcha === 'undefined' || !grecaptcha.enterprise || !grecaptcha.enterprise.execute) {
+            if (typeof grecaptcha === 'undefined' || !grecaptcha.enterprise) {
                 callback(null);
                 return;
             }
-            grecaptcha.enterprise.execute(sitekey, { action: action })
-                .then(function(t) { callback(t || null); })
-                .catch(function(err) { callback(null); });
+            function run() {
+                if (typeof grecaptcha.enterprise.execute !== 'function') {
+                    callback(null);
+                    return;
+                }
+                grecaptcha.enterprise.execute(sitekey, { action: action })
+                    .then(function(t) { callback(t || null); })
+                    .catch(function(err) { callback(null); });
+            }
+            if (typeof grecaptcha.enterprise.ready === 'function') {
+                grecaptcha.enterprise.ready(run);
+            } else {
+                run();
+            }
             """,
             sitekey.strip(),
             SII_RECAPTCHA_PAGE_ACTION,
@@ -477,7 +510,7 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
     error_msg = None
 
     try:
-        driver.get("https://www2.sii.cl/stc/noauthz")
+        driver.get(SII_CONSULTA_URL)
         # Con proxy residencial la primera carga del SII puede tardar mucho; dar 60 s al input
         wait = WebDriverWait(driver, 60)
 
@@ -491,14 +524,14 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
         time.sleep(0.5)
 
         sitekey = _obtener_sitekey_sii(driver)
-        # Esperar a que grecaptcha.enterprise esté disponible
-        for _ in range(8):
-            loaded = driver.execute_script(
-                "return typeof window.grecaptcha !== 'undefined' && window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function';"
-            )
-            if loaded:
-                break
-            time.sleep(2)
+        # Esperar a que reCAPTCHA cargue (necesario antes de grecaptcha.enterprise.execute)
+        wait_recaptcha = WebDriverWait(driver, 15)
+        wait_recaptcha.until(
+            lambda d: d.execute_script("return typeof window.grecaptcha !== 'undefined';")
+        )
+        wait_recaptcha.until(
+            lambda d: d.execute_script("return typeof window.grecaptcha.enterprise !== 'undefined';")
+        )
 
         # 1) Primera opción: token generado por el mismo navegador (sin 2Captcha)
         if sitekey:
