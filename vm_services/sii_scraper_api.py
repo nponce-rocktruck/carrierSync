@@ -21,6 +21,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+import requests
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -56,8 +58,13 @@ PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "")
 # Desactivar proxy para pruebas (SII_SCRAPER_USE_PROXY=false en la VM)
 SII_SCRAPER_USE_PROXY = os.getenv("SII_SCRAPER_USE_PROXY", "true").lower() not in ("false", "0", "no")
 
+# 2Captcha (misma API key que gestion_documental / verification_api)
+API_KEY_2CAPTCHA = os.getenv("API_KEY_2CAPTCHA", "e716e4f00d5e2225bcd8ed2a04981fe3")
+SII_RECAPTCHA_SITEKEY = os.getenv("SII_RECAPTCHA_SITEKEY", "").strip()
+SII_CONSULTA_URL = "https://www2.sii.cl/stc/noauthz"
 
-def _get_proxy_config() -> Optional[Dict[str, str]]:
+
+def _get_proxy_config() -> Optional[Dict[str, str]]: -> Optional[Dict[str, str]]:
     """
     Devuelve configuración de proxy para uso con extensión Chrome.
     Prioridad: OXY_* > HTTP_PROXY + PROXY_USER/PROXY_PASSWORD.
@@ -176,6 +183,113 @@ def _parsear_fecha_sii(texto: str) -> Optional[datetime]:
             return datetime(y, mo, d)
         except ValueError:
             return None
+    return None
+
+
+def _resolver_captcha_2captcha(website_url: str, website_key: str) -> Optional[str]:
+    """Resuelve reCAPTCHA con 2captcha (mismo esquema que gestion_documental/verification_api)."""
+    if not API_KEY_2CAPTCHA or not website_key:
+        return None
+    logger.info("[SII] Solicitando resolución a 2Captcha...")
+    payload = {
+        "clientKey": API_KEY_2CAPTCHA,
+        "task": {
+            "type": "RecaptchaV2EnterpriseTaskProxyless",
+            "websiteURL": website_url,
+            "websiteKey": website_key,
+            "isInvisible": False,
+        },
+    }
+    try:
+        res = requests.post("https://api.2captcha.com/createTask", json=payload, timeout=30).json()
+        if res.get("errorId") != 0:
+            logger.error("[SII] Error 2captcha createTask: %s", res)
+            return None
+        task_id = res.get("taskId")
+        max_attempts = 60
+        for attempt in range(max_attempts):
+            time.sleep(5)
+            status = requests.post(
+                "https://api.2captcha.com/getTaskResult",
+                json={"clientKey": API_KEY_2CAPTCHA, "taskId": task_id},
+                timeout=30,
+            ).json()
+            if status.get("status") == "ready":
+                token = status.get("solution", {}).get("gRecaptchaResponse")
+                logger.info("[SII] reCAPTCHA resuelto por 2Captcha")
+                return token
+            if status.get("errorId") != 0:
+                logger.error("[SII] Error 2captcha getTaskResult: %s", status)
+                return None
+            if attempt % 6 == 0:
+                logger.info("[SII] Esperando resolución reCAPTCHA... (%ds)", (attempt + 1) * 5)
+        logger.error("[SII] Timeout esperando resolución reCAPTCHA")
+        return None
+    except Exception as e:
+        logger.exception("[SII] Error al resolver reCAPTCHA: %s", e)
+        return None
+
+
+def _inyectar_token_captcha(driver, token: str) -> None:
+    """Inyecta token reCAPTCHA y ejecuta callback (igual que verification_api)."""
+    logger.info("[SII] Inyectando token reCAPTCHA...")
+    script_js = """
+    var token = arguments[0];
+    try {
+        var area = document.getElementById('g-recaptcha-response');
+        if (area) { area.value = token; area.innerHTML = token; }
+        if (typeof (___grecaptcha_cfg) !== 'undefined') {
+            for (let i in ___grecaptcha_cfg.clients) {
+                let client = ___grecaptcha_cfg.clients[i];
+                for (let prop in client) {
+                    if (client[prop] && typeof client[prop].callback === 'function') {
+                        client[prop].callback(token);
+                    }
+                }
+            }
+        }
+        if (typeof grecaptcha !== 'undefined' && grecaptcha.enterprise) {
+            try { grecaptcha.enterprise.getResponse && grecaptcha.enterprise.getResponse(); } catch(e){}
+        }
+    } catch (e) { console.error(e); }
+    """
+    driver.execute_script(script_js, token)
+    driver.execute_script(
+        """
+        var t = arguments[0];
+        var el = document.getElementById('g-recaptcha-response');
+        if (el) {
+            el.value = t;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+    """,
+        token,
+    )
+    logger.info("[SII] Token reCAPTCHA inyectado")
+
+
+def _obtener_sitekey_sii(driver) -> Optional[str]:
+    """Obtiene el sitekey de reCAPTCHA del SII desde la página o env."""
+    if SII_RECAPTCHA_SITEKEY:
+        return SII_RECAPTCHA_SITEKEY
+    try:
+        sitekey = driver.execute_script(
+            """
+            var el = document.querySelector('[data-sitekey]');
+            if (el) return el.getAttribute('data-sitekey');
+            if (typeof ___grecaptcha_cfg !== 'undefined') {
+                var clients = ___grecaptcha_cfg.clients || {};
+                for (var k in clients) {
+                    var c = clients[k];
+                    if (c && c.K && c.K.sitekey) return c.K.sitekey;
+                }
+            }
+            return null;
+        """
+        )
+        return (sitekey or "").strip() or None
+    except Exception as e:
+        logger.warning("[SII] No se pudo obtener sitekey del DOM: %s", e)
     return None
 
 
@@ -321,6 +435,25 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
         logger.info("[SII] RUT escrito en input: %s", rut_para_sii)
         time.sleep(0.5)
 
+        # Resolver reCAPTCHA con 2Captcha antes de enviar (mismo esquema que gestion_documental)
+        sitekey = _obtener_sitekey_sii(driver)
+        if API_KEY_2CAPTCHA and sitekey:
+            for _ in range(3):
+                loaded = driver.execute_script(
+                    "return typeof grecaptcha !== 'undefined' || (typeof window.grecaptcha !== 'undefined' && window.grecaptcha && window.grecaptcha.enterprise);"
+                )
+                if loaded:
+                    break
+                time.sleep(3)
+            token = _resolver_captcha_2captcha(SII_CONSULTA_URL, sitekey)
+            if token:
+                _inyectar_token_captcha(driver, token)
+                time.sleep(2)
+            else:
+                logger.warning("[SII] 2Captcha no devolvió token, continuando sin él (puede fallar por ReCaptcha)")
+        elif not sitekey:
+            logger.debug("[SII] Sin SII_RECAPTCHA_SITEKEY ni sitekey en página; no se usa 2Captcha")
+
         # Consultar Situación Tributaria
         btn_consultar = wait.until(
             EC.element_to_be_clickable((By.XPATH, "//input[@value='Consultar Situación Tributaria']"))
@@ -329,6 +462,24 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
         driver.execute_script("arguments[0].click();", btn_consultar)
         logger.info("[SII] Click en Consultar Situación Tributaria, esperando carga...")
         time.sleep(6)  # SPA: dar tiempo a que el SII renderice resultados (proxy/headless puede ser lento)
+
+        # Detección de rechazo por reCAPTCHA (SII bloquea headless/proxy)
+        page_source = driver.page_source or ""
+        if "no autorizado por ReCaptcha" in page_source or "usuario no autorizado por ReCaptcha" in page_source:
+            logger.warning("[SII] RUT %s: SII rechazó la consulta por reCAPTCHA (headless/proxy detectado)", rut)
+            try:
+                debug_dir = VM_TEMP_BASE / "debug"
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                (debug_dir / "sii_no_open_btn.html").write_text(page_source, encoding="utf-8", errors="replace")
+                (debug_dir / "sii_no_open_btn_url.txt").write_text(driver.current_url or "", encoding="utf-8")
+            except Exception as ex:
+                logger.warning("[SII] No se pudo guardar debug: %s", ex)
+            return {
+                "success": False,
+                "activities": [],
+                "not_found": True,
+                "error": "SII rechazó la consulta: usuario no autorizado por ReCaptcha (headless o proxy detectado). Ver documentación README_VM.md.",
+            }
 
         # Botón desplegar actividades (en headless + proxy puede tardar bastante)
         btn_desplegar_clicked = False

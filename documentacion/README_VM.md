@@ -240,7 +240,26 @@ Comprobar: `curl -s http://localhost:8082/health`.
 - **Desde la PC “connection refused” al 8082:** Comprueba el firewall (paso 2.1) y en la VM: `sudo systemctl status carrier-sii-scraper` (debe decir “active (running)”).
 - **En /health sale "selenium": false:** Chromium no está bien instalado o no se instalaron las dependencias del venv; repite el paso de Chromium y `./venv/bin/pip install -r requirements_vm.txt`.
 - **Disco lleno en la VM:** El scraper limpia temporales; además puedes llamar a `POST http://34.176.102.209:8082/api/v1/cleanup` para forzar limpieza.
-- **El SII bloquea o no devuelve datos:** Configura proxy residencial (Oxylabs) como en gestion_documental; ver sección "Configurar proxy residencial" más abajo.
+- **El SII bloquea o no devuelve datos:** Configura proxy residencial (Oxylabs) como en gestion_documental; ver sección "Configurar proxy residencial" más abajo. Si el SII responde con **"usuario no autorizado por ReCaptcha"**, ver sección 7.2.
+
+---
+
+## 7.2 Mensaje «usuario no autorizado por ReCaptcha»
+
+Si en los logs o en la respuesta del API aparece que el SII rechazó la consulta por **ReCaptcha**, significa que el portal del SII ha detectado el acceso automatizado (Chrome headless y/o proxy) y no muestra resultados; en su lugar muestra un mensaje de error y un botón "Volver".
+
+**Causa:** El SII usa reCAPTCHA para validar que la consulta la hace un humano. En entornos headless o con ciertos proxies, la validación falla.
+
+**Qué hace el scraper:** Detecta ese mensaje y devuelve `success: false` con `error` indicando "usuario no autorizado por ReCaptcha", para que no se confunda con "RUT sin actividades".
+
+**Opciones posibles (avanzado):**
+
+1. **Probar sin proxy:** Si en tu caso el SII no bloquea por IP, pon `SII_SCRAPER_USE_PROXY=false` en el servicio y reinicia. Así se evita el proxy; a veces reCAPTCHA se aplica más con proxy.
+2. **2Captcha (integrado):** El scraper ya usa la misma API de 2Captcha que gestion_documental. Configura `API_KEY_2CAPTCHA` y, si hace falta, `SII_RECAPTCHA_SITEKEY`. Ver sección **7.3 Configurar 2Captcha**.
+3. **Consultas manuales / API oficial:** Si el SII ofrece una API o proceso manual para obtener actividades económicas, usarla como alternativa.
+
+Para confirmar que es reCAPTCHA, en la VM puedes revisar el HTML guardado:
+`grep -i recaptcha /tmp/carriersync_scraper/debug/sii_no_open_btn.html`
 
 ---
 
@@ -268,6 +287,28 @@ Environment=OXY_PORT=60000
 ```
 
 Luego: `sudo systemctl daemon-reload && sudo systemctl restart carrier-sii-scraper`. En logs: `[SII] Proxy residencial configurado (extensión auth): ...`.
+
+---
+
+## 7.3 Configurar 2Captcha (reCAPTCHA)
+
+El scraper usa la **misma API de 2Captcha** que gestion_documental (verification_api). Así se evita el mensaje "usuario no autorizado por ReCaptcha" del SII.
+
+**Credenciales:** La misma `API_KEY_2CAPTCHA` que en la VM de verificación DT. En el servicio compartido ya está puesta en `scripts_vm/carrier-sii-scraper-shared-vm.service`. Si usas `env.proxy`, añade en ese archivo:
+
+```bash
+API_KEY_2CAPTCHA=tu_api_key_2captcha
+```
+
+**Sitekey del SII:** El código intenta leer el sitekey de reCAPTCHA desde la página. Si no lo encuentra (por ejemplo reCAPTCHA invisible), define la variable de entorno:
+
+```bash
+SII_RECAPTCHA_SITEKEY=el_sitekey_del_sii
+```
+
+Para obtener el sitekey: en el navegador, abre la página de consulta del SII, inspecciona el HTML y busca `data-sitekey` en el div de reCAPTCHA, o el parámetro en el script de recaptcha.
+
+En logs verás: `[SII] Solicitando resolución a 2Captcha...` y `[SII] reCAPTCHA resuelto por 2Captcha` cuando funcione.
 
 ---
 
