@@ -292,6 +292,8 @@ Luego: `sudo systemctl daemon-reload && sudo systemctl restart carrier-sii-scrap
 
 ## 7.3 Configurar 2Captcha (reCAPTCHA)
 
+**Flujo del scraper:** Primero intenta obtener el token **desde el mismo navegador** (llamando `grecaptcha.enterprise.execute()` en la página del SII). Si Google acepta ese token y el SII devuelve los giros, no se usa 2Captcha. Solo si el token del navegador es rechazado (`captchaInvalido=true`) o no se puede obtener, se usa 2Captcha como respaldo. Así se evita depender de 2Captcha cuando el entorno (p. ej. sin headless o con buena IP) es aceptado por reCAPTCHA.
+
 El scraper usa la **misma API de 2Captcha** que gestion_documental (verification_api). Así se evita el mensaje "usuario no autorizado por ReCaptcha" del SII.
 
 **Credenciales:** La misma `API_KEY_2CAPTCHA` que en la VM de verificación DT. En el servicio compartido ya está puesta en `scripts_vm/carrier-sii-scraper-shared-vm.service`. Si usas `env.proxy`, añade en ese archivo:
@@ -318,10 +320,14 @@ En logs verás: `[SII] Solicitando resolución a 2Captcha...` y `[SII] reCAPTCHA
 
 ## 7.4 Si falla en todas las consultas (captchaInvalido con proxy)
 
-Cuando **todas** las consultas devuelven rechazo por reCAPTCHA o `captchaInvalido=true` en la API del SII, el backend valida el token con Google y lo rechaza porque el token de 2Captcha se generó desde otra IP. Opciones para sacar el desarrollo:
+Cuando **todas** las consultas devuelven rechazo por reCAPTCHA o `captchaInvalido=true` en la API del SII, el backend valida el token con Google y lo rechaza.
 
-**1. Probar sin proxy (validar que el flujo funciona)**  
-Aunque después el SII pueda bloquear la IP, conviene probar **1–2 veces sin proxy** para confirmar que el token sí es aceptado cuando la petición sale desde la VM. Pasos:
+**Resultado de la prueba sin proxy:** Si probaste con `SII_SCRAPER_USE_PROXY=false` y en logs aparece `[SII] API getConsultaData devolvió captchaInvalido=true`, significa que **incluso sin proxy** Google/SII rechazan el token: 2Captcha lo genera en sus workers (otra IP y otro navegador), y reCAPTCHA v3 Enterprise valida que el token se use en el mismo contexto. **2Captcha no admite proxy para reCAPTCHA v3** (según su documentación, el uso de proxy reduce mucho la tasa de acierto), así que no se puede hacer que el worker resuelva desde la misma IP que nuestro Chrome. Con proxy o sin él, el token sigue siendo rechazado.
+
+Opciones viables:
+
+**1. Probar sin proxy (solo para descartar)**  
+Sirve para confirmar que el rechazo es por el token y no por la IP. Pasos:
 
 1. **En la VM**, editar el servicio y activar la variable:
    ```bash
@@ -347,21 +353,18 @@ Aunque después el SII pueda bloquear la IP, conviene probar **1–2 veces sin p
    ```bash
    curl -X POST "http://localhost:8082/api/v1/sii/giros" -H "Content-Type: application/json" -d "{\"rut\": \"RUT_CON_PUNTOS_Y_DV\"}"
    ```
-   Si en la respuesta ves actividades y en logs `[SII] RUT ...: N actividades desde API getConsultaData`, el flujo está bien y el problema es solo proxy + 2Captcha.
+   Si aparece `[SII] API getConsultaData devolvió captchaInvalido=true`, el token de 2Captcha no es aceptado ni siquiera sin proxy (caso habitual).
 
-5. **Volver a activar el proxy** cuando termines de probar: quita la línea `Environment="SII_SCRAPER_USE_PROXY=false"` (o cámbiala a `true`), luego `sudo systemctl daemon-reload && sudo systemctl restart carrier-sii-scraper`.
+5. **Volver a activar el proxy** cuando termines de probar: quita la línea `Environment="SII_SCRAPER_USE_PROXY=false"`, luego `sudo systemctl daemon-reload && sudo systemctl restart carrier-sii-scraper`.
 
-**2. Sin proxy con poca frecuencia**  
-Si sin proxy el token es aceptado pero el SII bloquea tras varias solicitudes: limitar a pocas consultas por hora/día (cola, reintentos espaciados) o usar otra IP (otra VM, VPN) y rotar cuando bloqueen.
+**2. Otro servicio anti-captcha**  
+Probar un proveedor que permita reCAPTCHA v3 Enterprise **con proxy** (misma IP que el navegador), por ejemplo Capsolver o Anti-Captcha, e integrar su API en lugar de 2Captcha.
 
-**3. Otro servicio anti-captcha**  
-Probar un proveedor que permita reCAPTCHA v3 **con proxy** (misma IP que el navegador), por ejemplo Capsolver o Anti-Captcha, e integrar su API en lugar de 2Captcha.
-
-**4. Solicitar API o canal oficial al SII**  
+**3. Solicitar API o canal oficial al SII**  
 Preguntar al SII si tienen API oficial o convenio para consultar situación tributaria/giros sin reCAPTCHA. Es la opción más estable a largo plazo.
 
-**5. Proceso manual o semiautomático**  
-Mientras no haya API: que un usuario resuelva el captcha en el navegador para casos críticos; el resto en cola o "pendiente de verificación".
+**4. Proceso manual o semiautomático**  
+Mientras no haya API ni captcha que funcione: que un usuario resuelva el captcha en el navegador para casos críticos; el resto en cola o "pendiente de verificación".
 
 ---
 

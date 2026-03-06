@@ -312,6 +312,38 @@ def _obtener_sitekey_sii(driver) -> Optional[str]:
     return None
 
 
+def _obtener_token_desde_navegador(driver, sitekey: str) -> Optional[str]:
+    """
+    Obtiene el token reCAPTCHA llamando grecaptcha.enterprise.execute() en el mismo
+    navegador que tiene la página del SII. El token es válido porque Google lo generó
+    en ese mismo contexto (misma IP, mismo navegador). No usa 2Captcha.
+    """
+    if not sitekey or not sitekey.strip():
+        return None
+    try:
+        token = driver.execute_async_script(
+            """
+            var sitekey = arguments[0];
+            var action = arguments[1];
+            var callback = arguments[arguments.length - 1];
+            if (typeof grecaptcha === 'undefined' || !grecaptcha.enterprise || !grecaptcha.enterprise.execute) {
+                callback(null);
+                return;
+            }
+            grecaptcha.enterprise.execute(sitekey, { action: action })
+                .then(function(t) { callback(t || null); })
+                .catch(function(err) { callback(null); });
+            """,
+            sitekey.strip(),
+            SII_RECAPTCHA_PAGE_ACTION,
+        )
+        if token and isinstance(token, str) and len(token) > 20:
+            return token
+    except Exception as e:
+        logger.warning("[SII] No se pudo obtener token desde el navegador (grecaptcha.enterprise.execute): %s", e)
+    return None
+
+
 def _cleanup_old_sessions() -> int:
     """
     Borra directorios de sesión Chrome en VM_TEMP_BASE más viejos que VM_CLEANUP_MAX_AGE_MINUTES.
@@ -377,6 +409,8 @@ def _crear_driver(headless: bool = True):
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    # Reducir detección de automatización (reCAPTCHA v3 puede dar mejor score)
+    options.add_argument("--disable-blink-features=AutomationControlled")
     # Reducir uso de disco: user-data-dir en nuestro temp y desactivar cachés
     options.add_argument(f"--user-data-dir={session_dir}")
     options.add_argument("--disk-cache-size=0")
@@ -449,8 +483,82 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
 
         # Ingresar RUT en formato que espera el SII: 17.807.161-0 (con puntos de miles)
         input_rut = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input.rut-form")))
-        # Antes de nada: preparar override de execute() con getter para que el SII use siempre nuestro token
-        # (así aunque su JS haya guardado una referencia, el getter se evalúa al llamar)
+        time.sleep(1)
+
+        input_rut.clear()
+        input_rut.send_keys(rut_para_sii)
+        logger.info("[SII] RUT escrito en input: %s", rut_para_sii)
+        time.sleep(0.5)
+
+        sitekey = _obtener_sitekey_sii(driver)
+        # Esperar a que grecaptcha.enterprise esté disponible
+        for _ in range(8):
+            loaded = driver.execute_script(
+                "return typeof window.grecaptcha !== 'undefined' && window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function';"
+            )
+            if loaded:
+                break
+            time.sleep(2)
+
+        # 1) Primera opción: token generado por el mismo navegador (sin 2Captcha)
+        if sitekey:
+            token_browser = _obtener_token_desde_navegador(driver, sitekey)
+            if token_browser:
+                logger.info("[SII] Token obtenido desde el propio navegador (grecaptcha.enterprise.execute)")
+                rut_num, dv = _rut_num_y_dv(rut)
+                if rut_num and dv:
+                    try:
+                        api_result = driver.execute_async_script(
+                            """
+                            var rutNum = arguments[0];
+                            var dv = arguments[1];
+                            var token = arguments[2];
+                            var callback = arguments[arguments.length - 1];
+                            fetch('https://www2.sii.cl/app/stc/recurso/v1/consulta/getConsultaData/', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    rut: rutNum,
+                                    dv: dv,
+                                    reAction: 'consultaSTC',
+                                    reToken: token
+                                })
+                            })
+                            .then(function(r) { return r.json(); })
+                            .then(function(data) { callback(data); })
+                            .catch(function(err) { callback({ captchaInvalido: true, error: err.toString() }); });
+                            """,
+                            rut_num,
+                            dv,
+                            token_browser,
+                        )
+                        if isinstance(api_result, dict) and api_result.get("captchaInvalido") is False:
+                            giros = api_result.get("girosNegocio") or []
+                            for g in giros:
+                                activities.append({
+                                    "code": str(g.get("codigo", "")).strip(),
+                                    "description": str(g.get("descripcion", "")).strip(),
+                                    "category": str(g.get("categoriaTributaria", "")).strip(),
+                                    "isVatSubject": str(g.get("indicadorAfectoIva", "")).upper() in ("SI", "SÍ"),
+                                    "fecha": str(g.get("fechaInicio", "")).strip(),
+                                    "startDate": _parsear_fecha_sii(str(g.get("fechaInicio", ""))),
+                                    "lastUpdatedAt": datetime.utcnow(),
+                                })
+                            logger.info("[SII] RUT %s: %d actividades desde API getConsultaData (token del navegador)", rut, len(activities))
+                            return {
+                                "success": True,
+                                "activities": activities,
+                                "not_found": not activities,
+                                "error": None,
+                            }
+                        if isinstance(api_result, dict) and api_result.get("captchaInvalido") is True:
+                            logger.info("[SII] Token del navegador rechazado (captchaInvalido=true), se usará 2Captcha como respaldo")
+                    except Exception as api_err:
+                        logger.warning("[SII] Error llamando API getConsultaData con token del navegador: %s", api_err)
+            else:
+                logger.info("[SII] No se pudo obtener token desde el navegador, se usará 2Captcha")
+
+        # 2) Respaldo: override de execute() y 2Captcha (para cuando headless/proxy hace que Google rechace el token del navegador)
         driver.execute_script(
             """
             window.__SII_RECAPTCHA_TOKEN = null;
@@ -470,15 +578,9 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
             }, 200);
             """
         )
-        time.sleep(1.5)
-
-        input_rut.clear()
-        input_rut.send_keys(rut_para_sii)
-        logger.info("[SII] RUT escrito en input: %s", rut_para_sii)
         time.sleep(0.5)
 
         # Resolver reCAPTCHA con 2Captcha antes de enviar (mismo esquema que gestion_documental)
-        sitekey = _obtener_sitekey_sii(driver)
         if API_KEY_2CAPTCHA and sitekey:
             for _ in range(3):
                 loaded = driver.execute_script(
