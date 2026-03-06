@@ -361,8 +361,13 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
             logger.info("[SII] RUT %s: extraídas %d actividades correctamente", rut, len(activities))
 
     except Exception as e:
-        logger.exception("[SII] Error extrayendo giros para %s: %s", rut, e)
-        error_msg = str(e)
+        error_type = type(e).__name__
+        error_detail = getattr(e, "msg", None) or (e.args[0] if e.args else str(e))
+        logger.exception(
+            "[SII] Error extrayendo giros para %s: %s - %s (detalle: %s)",
+            rut, error_type, error_detail, e.args
+        )
+        error_msg = str(e) or f"{error_type}: {error_detail}"
         not_found = "no se encontró" in str(e).lower() or "not found" in str(e).lower()
     finally:
         try:
