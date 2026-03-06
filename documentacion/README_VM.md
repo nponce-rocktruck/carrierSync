@@ -87,6 +87,11 @@ git pull
 sudo systemctl restart carrier-sii-scraper
 curl -s http://localhost:8082/health
 
+
+sudo journalctl -u carrier-sii-scraper -n 80 --no-pager
+
+
+
 Acción	Comando
 Ver estado	sudo systemctl status carrier-sii-scraper
 Reiniciar	sudo systemctl restart carrier-sii-scraper

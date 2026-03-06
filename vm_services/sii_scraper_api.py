@@ -262,6 +262,9 @@ def _crear_driver(headless: bool = True):
     try:
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
+        # Con proxy la carga puede ser más lenta; timeouts largos evitan fallos sin mensaje
+        driver.set_page_load_timeout(60)
+        driver.implicitly_wait(5)
         return driver, session_dir
     except Exception as e:
         logger.exception("Error creando Chrome driver: %s", e)
@@ -299,7 +302,8 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
 
     try:
         driver.get("https://www2.sii.cl/stc/noauthz")
-        wait = WebDriverWait(driver, 20)
+        # Con proxy residencial la primera carga del SII puede tardar mucho; dar 60 s al input
+        wait = WebDriverWait(driver, 60)
 
         # Ingresar RUT en formato que espera el SII: 17.807.161-0 (con puntos de miles)
         input_rut = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input.rut-form")))
@@ -319,7 +323,7 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
 
         # Botón desplegar actividades (en headless puede tardar más)
         try:
-            btn_desplegar = WebDriverWait(driver, 10).until(
+            btn_desplegar = WebDriverWait(driver, 15).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, "button.open-btn"))
             )
             driver.execute_script("arguments[0].click();", btn_desplegar)
