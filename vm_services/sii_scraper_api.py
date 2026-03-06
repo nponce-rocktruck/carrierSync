@@ -459,6 +459,23 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
             token = _resolver_captcha_2captcha(SII_CONSULTA_URL, sitekey)
             if token:
                 _inyectar_token_captcha(driver, token)
+                # Para v3: el SII llama grecaptcha.enterprise.execute() al hacer click en Consultar.
+                # Sobrescribir execute para que devuelva nuestro token en lugar de llamar a Google.
+                try:
+                    driver.execute_script(
+                        """
+                        var token = arguments[0];
+                        if (window.grecaptcha && window.grecaptcha.enterprise && window.grecaptcha.enterprise.execute) {
+                            window.grecaptcha.enterprise.execute = function(siteKey, opts) {
+                                return Promise.resolve(token);
+                            };
+                        }
+                        """,
+                        token,
+                    )
+                    logger.info("[SII] grecaptcha.enterprise.execute sobrescrito para usar token de 2Captcha")
+                except Exception as ex:
+                    logger.warning("[SII] No se pudo sobrescribir execute: %s", ex)
                 time.sleep(2)
             else:
                 logger.warning("[SII] 2Captcha no devolvió token, continuando sin él (puede fallar por ReCaptcha)")
