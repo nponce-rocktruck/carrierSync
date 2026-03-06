@@ -260,7 +260,8 @@ def _crear_driver(headless: bool = True):
                 proxy_cfg["username"], proxy_cfg["password"],
                 session_dir
             )
-            options.add_argument(f"--proxy-server=http://{proxy_cfg['host']}:{proxy_cfg['port']}")
+            # Igual que gestion_documental/verification_api: solo extensión, sin --proxy-server.
+            # La extensión configura el proxy con chrome.proxy.settings.set().
             options.add_argument(f"--load-extension={ext_path}")
             logger.info("[SII] Proxy residencial configurado (extensión auth): %s:%s", proxy_cfg["host"], proxy_cfg["port"])
         except Exception as e:
