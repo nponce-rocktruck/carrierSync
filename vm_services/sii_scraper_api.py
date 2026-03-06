@@ -331,19 +331,34 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
         time.sleep(2)
 
         # Botón desplegar actividades (en headless puede tardar más)
+        btn_desplegar_clicked = False
         try:
             btn_desplegar = WebDriverWait(driver, 15).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, "button.open-btn"))
             )
             driver.execute_script("arguments[0].click();", btn_desplegar)
             logger.info("[SII] Botón desplegar actividades encontrado y clickeado")
+            btn_desplegar_clicked = True
         except Exception as e:
-            # Puede no haber actividades para este RUT
-            logger.warning("[SII] No se encontró botón open-btn para RUT %s (posible sin actividades): %s", rut, e)
-            not_found = True
-            return {"success": True, "activities": [], "not_found": not_found, "error": None}
+            logger.warning("[SII] No se encontró botón open-btn para RUT %s, intentando tabla directa: %s", rut, e)
+            try:
+                debug_dir = VM_TEMP_BASE / "debug"
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                (debug_dir / "sii_no_open_btn.html").write_text(driver.page_source or "", encoding="utf-8", errors="replace")
+                (debug_dir / "sii_no_open_btn_url.txt").write_text(driver.current_url or "", encoding="utf-8")
+                logger.info("[SII] Debug: HTML guardado en %s/sii_no_open_btn.html", debug_dir)
+            except Exception as ex:
+                logger.warning("[SII] No se pudo guardar debug (no open-btn): %s", ex)
 
-        wait.until(EC.visibility_of_element_located((By.ID, "DataTables_Table_0")))
+        # Tabla de actividades (puede estar ya visible sin click en open-btn)
+        try:
+            wait.until(EC.visibility_of_element_located((By.ID, "DataTables_Table_0")))
+        except Exception as e:
+            if not btn_desplegar_clicked:
+                logger.warning("[SII] RUT %s: tampoco se encontró tabla DataTables_Table_0 (sin actividades en SII)", rut)
+                not_found = True
+                return {"success": True, "activities": [], "not_found": not_found, "error": None}
+            raise
         time.sleep(1.5)
 
         filas = driver.find_elements(By.CSS_SELECTOR, "#DataTables_Table_0 tbody tr")
