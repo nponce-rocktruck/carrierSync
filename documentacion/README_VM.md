@@ -254,7 +254,7 @@ Si en los logs o en la respuesta del API aparece que el SII rechazó la consulta
 
 **Opciones posibles (avanzado):**
 
-1. **Probar sin proxy:** Si en tu caso el SII no bloquea por IP, pon `SII_SCRAPER_USE_PROXY=false` en el servicio y reinicia. Así se evita el proxy; a veces reCAPTCHA se aplica más con proxy.
+1. **Sin proxy (solo pruebas):** `SII_SCRAPER_USE_PROXY=false` puede reducir rechazos de reCAPTCHA en algunos entornos, pero **en producción no conviene**: el SII suele bloquear la IP tras pocas solicitudes. Mantener el proxy es necesario para uso continuado.
 2. **2Captcha (integrado):** El scraper ya usa la misma API de 2Captcha que gestion_documental. Configura `API_KEY_2CAPTCHA` y, si hace falta, `SII_RECAPTCHA_SITEKEY`. Ver sección **7.3 Configurar 2Captcha**.
 3. **Consultas manuales / API oficial:** Si el SII ofrece una API o proceso manual para obtener actividades económicas, usarla como alternativa.
 
@@ -309,6 +309,8 @@ SII_RECAPTCHA_SITEKEY=el_sitekey_del_sii
 Para obtener el sitekey: en el navegador, abre la página de consulta del SII, inspecciona el HTML y busca `data-sitekey` en el div de reCAPTCHA, o el parámetro en el script de recaptcha.
 
 En logs verás: `[SII] Solicitando resolución a 2Captcha...` y `[SII] reCAPTCHA resuelto por 2Captcha` cuando funcione.
+
+**Si el SII sigue mostrando "usuario no autorizado por ReCaptcha"** tras inyectar el token: (1) Pruebe otro `pageAction`: en el servicio defina `SII_RECAPTCHA_PAGE_ACTION=submit` (o el valor que use el SII; puede inspeccionar la pestaña Red del navegador). (2) El backend del SII puede validar el token de forma estricta (ventana de validez, fingerprint); 2Captcha con reCAPTCHA v3 no permite usar el mismo proxy que el navegador, así que no se puede “resolver desde la misma IP”. Mantener el proxy es necesario para no ser bloqueado por IP tras varias solicitudes.
 
 ---
 

@@ -62,8 +62,8 @@ SII_SCRAPER_USE_PROXY = os.getenv("SII_SCRAPER_USE_PROXY", "true").lower() not i
 API_KEY_2CAPTCHA = os.getenv("API_KEY_2CAPTCHA", "e716e4f00d5e2225bcd8ed2a04981fe3")
 SII_RECAPTCHA_SITEKEY = os.getenv("SII_RECAPTCHA_SITEKEY", "").strip()
 SII_CONSULTA_URL = "https://www2.sii.cl/stc/noauthz"
-# Acción para reCAPTCHA v3 Enterprise (el SII usa v3; pageAction típico: submit, consultar)
-SII_RECAPTCHA_PAGE_ACTION = os.getenv("SII_RECAPTCHA_PAGE_ACTION", "consultar")
+# Acción para reCAPTCHA v3 Enterprise (debe coincidir con la que usa el SII al llamar execute; la API usa reAction: consultaSTC)
+SII_RECAPTCHA_PAGE_ACTION = os.getenv("SII_RECAPTCHA_PAGE_ACTION", "consultaSTC")
 
 
 def _get_proxy_config() -> Optional[Dict[str, str]]:
@@ -170,6 +170,14 @@ def _rut_con_puntos(rut_normalizado: str) -> str:
         partes.append(numero[-3:])
         numero = numero[:-3]
     return ".".join(reversed(partes)) + "-" + dv.upper()
+
+
+def _rut_num_y_dv(rut_normalizado: str) -> tuple:
+    """Devuelve (numero_sin_dv, dv) para la API getConsultaData. Ej: 17807161-0 -> ('17807161', '0')."""
+    if not rut_normalizado or "-" not in rut_normalizado:
+        return ("", "")
+    num, dv = rut_normalizado.rsplit("-", 1)
+    return (num.replace(".", "").strip(), dv.strip().upper())
 
 
 def _parsear_fecha_sii(texto: str) -> Optional[datetime]:
@@ -441,6 +449,29 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
 
         # Ingresar RUT en formato que espera el SII: 17.807.161-0 (con puntos de miles)
         input_rut = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input.rut-form")))
+        # Antes de nada: preparar override de execute() con getter para que el SII use siempre nuestro token
+        # (así aunque su JS haya guardado una referencia, el getter se evalúa al llamar)
+        driver.execute_script(
+            """
+            window.__SII_RECAPTCHA_TOKEN = null;
+            var check = setInterval(function() {
+                if (window.grecaptcha && window.grecaptcha.enterprise) {
+                    clearInterval(check);
+                    try {
+                        Object.defineProperty(window.grecaptcha.enterprise, 'execute', {
+                            get: function() {
+                                return function() { return Promise.resolve(window.__SII_RECAPTCHA_TOKEN || ''); };
+                            },
+                            configurable: true,
+                            enumerable: true
+                        });
+                    } catch (e) {}
+                }
+            }, 200);
+            """
+        )
+        time.sleep(1.5)
+
         input_rut.clear()
         input_rut.send_keys(rut_para_sii)
         logger.info("[SII] RUT escrito en input: %s", rut_para_sii)
@@ -459,24 +490,65 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
             token = _resolver_captcha_2captcha(SII_CONSULTA_URL, sitekey)
             if token:
                 _inyectar_token_captcha(driver, token)
-                # Para v3: el SII llama grecaptcha.enterprise.execute() al hacer click en Consultar.
-                # Sobrescribir execute para que devuelva nuestro token en lugar de llamar a Google.
                 try:
-                    driver.execute_script(
-                        """
-                        var token = arguments[0];
-                        if (window.grecaptcha && window.grecaptcha.enterprise && window.grecaptcha.enterprise.execute) {
-                            window.grecaptcha.enterprise.execute = function(siteKey, opts) {
-                                return Promise.resolve(token);
-                            };
-                        }
-                        """,
-                        token,
-                    )
-                    logger.info("[SII] grecaptcha.enterprise.execute sobrescrito para usar token de 2Captcha")
+                    driver.execute_script("window.__SII_RECAPTCHA_TOKEN = arguments[0];", token)
+                    logger.info("[SII] Token asignado a __SII_RECAPTCHA_TOKEN para execute()")
                 except Exception as ex:
-                    logger.warning("[SII] No se pudo sobrescribir execute: %s", ex)
-                time.sleep(2)
+                    logger.warning("[SII] No se pudo asignar token global: %s", ex)
+                time.sleep(1)
+                # Llamar directamente a la API del SII (mismo endpoint que usa el front al hacer click)
+                rut_num, dv = _rut_num_y_dv(rut)
+                if rut_num and dv:
+                    try:
+                        api_result = driver.execute_async_script(
+                            """
+                            var rutNum = arguments[0];
+                            var dv = arguments[1];
+                            var token = arguments[2];
+                            var callback = arguments[arguments.length - 1];
+                            fetch('https://www2.sii.cl/app/stc/recurso/v1/consulta/getConsultaData/', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    rut: rutNum,
+                                    dv: dv,
+                                    reAction: 'consultaSTC',
+                                    reToken: token
+                                })
+                            })
+                            .then(function(r) { return r.json(); })
+                            .then(function(data) { callback(data); })
+                            .catch(function(err) { callback({ captchaInvalido: true, error: err.toString() }); });
+                            """,
+                            rut_num,
+                            dv,
+                            token,
+                        )
+                        if isinstance(api_result, dict) and api_result.get("captchaInvalido") is False:
+                            giros = api_result.get("girosNegocio") or []
+                            for g in giros:
+                                activities.append({
+                                    "code": str(g.get("codigo", "")).strip(),
+                                    "description": str(g.get("descripcion", "")).strip(),
+                                    "category": str(g.get("categoriaTributaria", "")).strip(),
+                                    "isVatSubject": str(g.get("indicadorAfectoIva", "")).upper() in ("SI", "SÍ"),
+                                    "fecha": str(g.get("fechaInicio", "")).strip(),
+                                    "startDate": _parsear_fecha_sii(str(g.get("fechaInicio", ""))),
+                                    "lastUpdatedAt": datetime.utcnow(),
+                                })
+                            logger.info("[SII] RUT %s: %d actividades desde API getConsultaData", rut, len(activities))
+                            # Éxito vía API; salir del try principal sin click ni scrape
+                            return {
+                                "success": True,
+                                "activities": activities,
+                                "not_found": not activities,
+                                "error": None,
+                            }
+                        if isinstance(api_result, dict) and api_result.get("captchaInvalido") is True:
+                            logger.warning("[SII] API getConsultaData devolvió captchaInvalido=true")
+                    except Exception as api_err:
+                        logger.warning("[SII] Error llamando API getConsultaData: %s", api_err)
+                time.sleep(1)
             else:
                 logger.warning("[SII] 2Captcha no devolvió token, continuando sin él (puede fallar por ReCaptcha)")
         elif not sitekey:
@@ -581,10 +653,17 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
     except Exception as e:
         error_type = type(e).__name__
         error_detail = getattr(e, "msg", None) or (e.args[0] if e.args else str(e))
+        err_str = str(e)
         logger.exception(
             "[SII] Error extrayendo giros para %s: %s - %s (detalle: %s)",
             rut, error_type, error_detail, e.args
         )
+        # Chrome/driver murió (Connection refused) — suele ser OOM o muchas peticiones a la vez
+        if "Connection refused" in err_str or "MaxRetryError" in err_str:
+            error_msg = "Chrome/driver se cerró inesperadamente (posible falta de memoria en la VM). Evite lanzar muchas consultas a la vez."
+        else:
+            error_msg = err_str or f"{error_type}: {error_detail}"
+        not_found = "no se encontró" in err_str.lower() or "not found" in err_str.lower()
         # En timeout de la primera carga, guardar HTML y URL para ver qué recibió Chrome (proxy/página)
         if error_type == "TimeoutException" and driver:
             try:
@@ -597,8 +676,6 @@ def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
                 logger.warning("[SII] Debug: guardado %s y %s (revisar qué cargó Chrome)", path_html, path_url)
             except Exception as ex:
                 logger.warning("[SII] No se pudo guardar debug: %s", ex)
-        error_msg = str(e) or f"{error_type}: {error_detail}"
-        not_found = "no se encontró" in str(e).lower() or "not found" in str(e).lower()
     finally:
         try:
             driver.quit()
