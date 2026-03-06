@@ -61,6 +61,8 @@ SII_SCRAPER_USE_PROXY = os.getenv("SII_SCRAPER_USE_PROXY", "true").lower() not i
 # 2Captcha (misma API key que gestion_documental / verification_api)
 API_KEY_2CAPTCHA = os.getenv("API_KEY_2CAPTCHA", "e716e4f00d5e2225bcd8ed2a04981fe3")
 SII_RECAPTCHA_SITEKEY = os.getenv("SII_RECAPTCHA_SITEKEY", "").strip()
+# Sitekey conocido de la página de consulta STC del SII (fallback si no se detecta en la página)
+SII_RECAPTCHA_SITEKEY_DEFAULT = "6Lc_DPAqAAAAAB7QWxHsaPDNxLLOUj9VkiuAXRYP"
 # reCAPTCHA solo se carga en la URL con .html (no en /noauthz sin extensión)
 SII_CONSULTA_URL = "https://www2.sii.cl/stc/noauthz.html"
 # Acción para reCAPTCHA v3 Enterprise (debe coincidir con la que usa el SII al llamar execute; la API usa reAction: consultaSTC)
@@ -331,7 +333,7 @@ def _obtener_sitekey_sii(driver) -> Optional[str]:
             return match.group(0)
     except Exception as e:
         logger.warning("[SII] No se pudo obtener sitekey del DOM: %s", e)
-    return None
+    return SII_RECAPTCHA_SITEKEY_DEFAULT or None
 
 
 def _obtener_token_desde_navegador(driver, sitekey: str) -> Optional[str]:
@@ -343,33 +345,42 @@ def _obtener_token_desde_navegador(driver, sitekey: str) -> Optional[str]:
     if not sitekey or not sitekey.strip():
         return None
     try:
+        # grecaptcha.enterprise.ready() + execute() pueden tardar con proxy; timeout 45 s
+        driver.set_script_timeout(45)
         token = driver.execute_async_script(
-            """
-            var sitekey = arguments[0];
-            var action = arguments[1];
-            var callback = arguments[arguments.length - 1];
-            if (typeof grecaptcha === 'undefined' || !grecaptcha.enterprise) {
-                callback(null);
-                return;
-            }
-            function run() {
-                if (typeof grecaptcha.enterprise.execute !== 'function') {
-                    callback(null);
+                """
+                var sitekey = arguments[0];
+                var action = arguments[1];
+                var callback = arguments[arguments.length - 1];
+                var done = false;
+                function finish(t) {
+                    if (done) return;
+                    done = true;
+                    callback(t || null);
+                }
+                setTimeout(function() { finish(null); }, 40000);
+                if (typeof grecaptcha === 'undefined' || !grecaptcha.enterprise) {
+                    finish(null);
                     return;
                 }
-                grecaptcha.enterprise.execute(sitekey, { action: action })
-                    .then(function(t) { callback(t || null); })
-                    .catch(function(err) { callback(null); });
-            }
-            if (typeof grecaptcha.enterprise.ready === 'function') {
-                grecaptcha.enterprise.ready(run);
-            } else {
-                run();
-            }
-            """,
-            sitekey.strip(),
-            SII_RECAPTCHA_PAGE_ACTION,
-        )
+                function run() {
+                    if (typeof grecaptcha.enterprise.execute !== 'function') {
+                        finish(null);
+                        return;
+                    }
+                    grecaptcha.enterprise.execute(sitekey, { action: action })
+                        .then(function(t) { finish(t || null); })
+                        .catch(function(err) { finish(null); });
+                }
+                if (typeof grecaptcha.enterprise.ready === 'function') {
+                    grecaptcha.enterprise.ready(run);
+                } else {
+                    run();
+                }
+                """,
+                sitekey.strip(),
+                SII_RECAPTCHA_PAGE_ACTION,
+            )
         if token and isinstance(token, str) and len(token) > 20:
             return token
     except Exception as e:
