@@ -64,7 +64,7 @@ SII_RECAPTCHA_SITEKEY = os.getenv("SII_RECAPTCHA_SITEKEY", "").strip()
 SII_CONSULTA_URL = "https://www2.sii.cl/stc/noauthz"
 
 
-def _get_proxy_config() -> Optional[Dict[str, str]]: -> Optional[Dict[str, str]]:
+def _get_proxy_config() -> Optional[Dict[str, str]]:
     """
     Devuelve configuración de proxy para uso con extensión Chrome.
     Prioridad: OXY_* > HTTP_PROXY + PROXY_USER/PROXY_PASSWORD.
