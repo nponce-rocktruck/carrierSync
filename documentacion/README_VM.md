@@ -290,27 +290,13 @@ Luego: `sudo systemctl daemon-reload && sudo systemctl restart carrier-sii-scrap
 
 ---
 
-## 7.3 Configurar 2Captcha (reCAPTCHA)
+## 7.3 reCAPTCHA: token del navegador (sin 2Captcha por defecto)
 
-**Flujo del scraper:** Primero intenta obtener el token **desde el mismo navegador** (llamando `grecaptcha.enterprise.execute()` en la página del SII). Si Google acepta ese token y el SII devuelve los giros, no se usa 2Captcha. Solo si el token del navegador es rechazado (`captchaInvalido=true`) o no se puede obtener, se usa 2Captcha como respaldo. Así se evita depender de 2Captcha cuando el entorno (p. ej. sin headless o con buena IP) es aceptado por reCAPTCHA.
+**Por defecto el scraper no usa 2Captcha.** Solo intenta obtener el token desde el mismo navegador (`grecaptcha.enterprise.execute()` en la página del SII). Si Google acepta ese token, se llama a la API del SII y se devuelven los giros. Si no, se hace click en "Consultar Situación Tributaria" (en headless/proxy el SII suele mostrar "usuario no autorizado por ReCaptcha").
 
-El scraper usa la **misma API de 2Captcha** que gestion_documental (verification_api). Así se evita el mensaje "usuario no autorizado por ReCaptcha" del SII.
+**Opcional – activar 2Captcha:** Define `SII_USE_2CAPTCHA=true` y `API_KEY_2CAPTCHA` en el servicio para usar 2Captcha cuando falle el token del navegador.
 
-**Credenciales:** La misma `API_KEY_2CAPTCHA` que en la VM de verificación DT. En el servicio compartido ya está puesta en `scripts_vm/carrier-sii-scraper-shared-vm.service`. Si usas `env.proxy`, añade en ese archivo:
-
-```bash
-API_KEY_2CAPTCHA=tu_api_key_2captcha
-```
-
-**Sitekey del SII:** El código intenta leer el sitekey de reCAPTCHA desde la página. Si no lo encuentra (por ejemplo reCAPTCHA invisible), define la variable de entorno:
-
-```bash
-SII_RECAPTCHA_SITEKEY=el_sitekey_del_sii
-```
-
-Para obtener el sitekey: en el navegador, abre la página de consulta del SII, inspecciona el HTML y busca `data-sitekey` en el div de reCAPTCHA, o el parámetro en el script de recaptcha.
-
-En logs verás: `[SII] Solicitando resolución a 2Captcha...` y `[SII] reCAPTCHA resuelto por 2Captcha` cuando funcione.
+**Sitekey:** El código usa un sitekey por defecto del SII; si hace falta otro, define `SII_RECAPTCHA_SITEKEY`.
 
 **Si el SII sigue mostrando "usuario no autorizado por ReCaptcha"** tras inyectar el token: (1) Pruebe otro `pageAction`: en el servicio defina `SII_RECAPTCHA_PAGE_ACTION=submit` (o el valor que use el SII; puede inspeccionar la pestaña Red del navegador). (2) El backend del SII puede validar el token de forma estricta (ventana de validez, fingerprint); 2Captcha con reCAPTCHA v3 no permite usar el mismo proxy que el navegador, así que no se puede “resolver desde la misma IP”. Mantener el proxy es necesario para no ser bloqueado por IP tras varias solicitudes.
 

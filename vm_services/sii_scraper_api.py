@@ -1,17 +1,19 @@
 """
 API de scraping SII para VM.
 Expone POST /api/v1/sii/giros con {"rut": "..."} y devuelve las actividades económicas.
+Arquitectura: 1 navegador Selenium + generador de tokens reCAPTCHA + requests al API del SII.
 Ejecutar en VM para no bloquear IPs (usar Oxylabs u otro proxy si se desea).
 
-Limpieza de espacio: cada sesión de Chrome usa un directorio temporal que se borra
-al terminar; además se ejecuta limpieza periódica para evitar llenar el disco
-(carga inicial 1000 RUTs, actualizaciones, consultas individuales).
+Limpieza de espacio: se usa un directorio temporal para el navegador global que se borra al apagar;
+además se ejecuta limpieza periódica de sesiones viejas (VM_CLEANUP_EVERY_N_REQUESTS) para evitar
+llenar el disco.
 """
 
 import os
 import re
 import time
 import shutil
+import queue
 import logging
 import threading
 import zipfile
@@ -45,35 +47,49 @@ except ImportError:
 
 app = FastAPI(title="CarrierSync VM - SII Scraper", version="1.0.0")
 
+# ----------------------------
+# CONFIG (tus variables)
+# ----------------------------
 OXY_USER = os.getenv("OXY_USER", "")
 OXY_PASS = os.getenv("OXY_PASS", "")
 OXY_HOST = os.getenv("OXY_HOST", "unblock.oxylabs.io")
 OXY_PORT = os.getenv("OXY_PORT", "60000")
 
-# Proxy alternativo por env (compatible con ProxyManager: HTTP_PROXY + PROXY_USER / PROXY_PASSWORD)
 HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
 PROXY_USER = os.getenv("PROXY_USER", "")
 PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "")
 
-# Desactivar proxy para pruebas (SII_SCRAPER_USE_PROXY=false en la VM)
 SII_SCRAPER_USE_PROXY = os.getenv("SII_SCRAPER_USE_PROXY", "true").lower() not in ("false", "0", "no")
 
-# 2Captcha (misma API key que gestion_documental / verification_api)
-API_KEY_2CAPTCHA = os.getenv("API_KEY_2CAPTCHA", "e716e4f00d5e2225bcd8ed2a04981fe3")
 SII_RECAPTCHA_SITEKEY = os.getenv("SII_RECAPTCHA_SITEKEY", "").strip()
-# Sitekey conocido de la página de consulta STC del SII (fallback si no se detecta en la página)
 SII_RECAPTCHA_SITEKEY_DEFAULT = "6Lc_DPAqAAAAAB7QWxHsaPDNxLLOUj9VkiuAXRYP"
-# reCAPTCHA solo se carga en la URL con .html (no en /noauthz sin extensión)
 SII_CONSULTA_URL = "https://www2.sii.cl/stc/noauthz.html"
-# Acción para reCAPTCHA v3 Enterprise (debe coincidir con la que usa el SII al llamar execute; la API usa reAction: consultaSTC)
+SII_GET_CONSULTA_DATA_URL = "https://www2.sii.cl/app/stc/recurso/v1/consulta/getConsultaData/"
 SII_RECAPTCHA_PAGE_ACTION = os.getenv("SII_RECAPTCHA_PAGE_ACTION", "consultaSTC")
+
+TOKEN_QUEUE_SIZE = int(os.getenv("TOKEN_QUEUE_SIZE", "100"))
+
+# --- Limpieza de espacio en disco (evitar llenar /tmp con sesiones viejas) ---
+VM_TEMP_BASE = Path(os.getenv("VM_TEMP_BASE_DIR", "/tmp/carriersync_scraper"))
+VM_CLEANUP_MAX_AGE_MINUTES = int(os.getenv("VM_CLEANUP_MAX_AGE_MINUTES", "15"))
+VM_CLEANUP_EVERY_N_REQUESTS = int(os.getenv("VM_CLEANUP_EVERY_N_REQUESTS", "50"))
+
+_request_count = 0
+_request_count_lock = threading.Lock()
+
+# ----------------------------
+# GLOBALS (1 navegador + cola de tokens)
+# ----------------------------
+driver = None
+session_dir = None
+token_queue = queue.Queue(maxsize=TOKEN_QUEUE_SIZE)
 
 
 def _get_proxy_config() -> Optional[Dict[str, str]]:
     """
-    Devuelve configuración de proxy para uso con extensión Chrome.
+    Devuelve configuración de proxy para uso con extensión Chrome y para requests.
     Prioridad: OXY_* > HTTP_PROXY + PROXY_USER/PROXY_PASSWORD.
-    Si SII_SCRAPER_USE_PROXY=false, no usa proxy (para probar desde la VM sin proxy).
+    Si SII_SCRAPER_USE_PROXY=false, no usa proxy.
     """
     if not SII_SCRAPER_USE_PROXY:
         return None
@@ -89,10 +105,18 @@ def _get_proxy_config() -> Optional[Dict[str, str]]:
     return None
 
 
+def _proxies_for_requests() -> Optional[Dict[str, str]]:
+    """Proxies en formato requests (mismo proxy que Selenium para consistencia con Oxylabs)."""
+    pc = _get_proxy_config()
+    if not pc:
+        return None
+    url = f"http://{pc['username']}:{pc['password']}@{pc['host']}:{pc['port']}"
+    return {"http": url, "https": url}
+
+
 def _crear_proxy_auth_extension(proxy_host: str, proxy_port: str, proxy_user: str, proxy_pass: str, out_dir: Path) -> str:
     """
     Crea una extensión de Chrome para autenticación de proxy (Oxylabs u otro proxy residencial).
-    Chrome no soporta user/pass en --proxy-server; la extensión responde a onAuthRequired.
     """
     plugin_path = out_dir / "proxy_auth_plugin.zip"
     manifest_json = json.dumps({
@@ -134,264 +158,14 @@ def _crear_proxy_auth_extension(proxy_host: str, proxy_port: str, proxy_user: st
         zp.writestr("background.js", background_js)
     return str(plugin_path)
 
-# --- Limpieza de espacio en disco (evitar llenar /tmp con 1000+ RUTs) ---
-# Directorio base para temporales de Chrome; se borra cada sesión y se hace limpieza periódica
-VM_TEMP_BASE = Path(os.getenv("VM_TEMP_BASE_DIR", "/tmp/carriersync_scraper"))
-# Borrar directorios de sesión más viejos que N minutos (por si un run crasheó sin limpiar)
-VM_CLEANUP_MAX_AGE_MINUTES = int(os.getenv("VM_CLEANUP_MAX_AGE_MINUTES", "15"))
-# Ejecutar limpieza de residuos cada N requests
-VM_CLEANUP_EVERY_N_REQUESTS = int(os.getenv("VM_CLEANUP_EVERY_N_REQUESTS", "50"))
 
-_request_count = 0
-_request_count_lock = threading.Lock()
-
-
-class GirosRequest(BaseModel):
-    rut: str
-
-
-def _normalizar_rut(rut: str) -> str:
-    """Quita puntos y deja formato 12345678-9."""
-    if not rut:
-        return ""
-    s = rut.strip().upper().replace(".", "").replace(" ", "")
-    if "-" not in s and len(s) >= 2 and s[-1] in "0123456789K":
-        return f"{s[:-1]}-{s[-1]}"
-    return s
-
-
-def _rut_con_puntos(rut_normalizado: str) -> str:
-    """Formatea RUT con puntos de miles para el SII (ej: 17807161-0 -> 17.807.161-0)."""
-    if not rut_normalizado or "-" not in rut_normalizado:
-        return rut_normalizado or ""
-    numero, dv = rut_normalizado.rsplit("-", 1)
-    numero = numero.replace(".", "")
-    if not numero.isdigit():
-        return rut_normalizado
-    partes = []
-    while numero:
-        partes.append(numero[-3:])
-        numero = numero[:-3]
-    return ".".join(reversed(partes)) + "-" + dv.upper()
-
-
-def _rut_num_y_dv(rut_normalizado: str) -> tuple:
-    """Devuelve (numero_sin_dv, dv) para la API getConsultaData. Ej: 17807161-0 -> ('17807161', '0')."""
-    if not rut_normalizado or "-" not in rut_normalizado:
-        return ("", "")
-    num, dv = rut_normalizado.rsplit("-", 1)
-    return (num.replace(".", "").strip(), dv.strip().upper())
-
-
-def _parsear_fecha_sii(texto: str) -> Optional[datetime]:
-    """Intenta parsear fecha tipo dd-mm-yyyy o similar."""
-    if not texto or not texto.strip():
-        return None
-    texto = texto.strip()
-    # dd-mm-yyyy o dd/mm/yyyy
-    m = re.match(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", texto)
-    if m:
-        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        try:
-            return datetime(y, mo, d)
-        except ValueError:
-            return None
-    return None
-
-
-def _resolver_captcha_2captcha(website_url: str, website_key: str) -> Optional[str]:
-    """Resuelve reCAPTCHA con 2captcha. El SII usa v3 Enterprise, no v2."""
-    if not API_KEY_2CAPTCHA or not website_key:
-        return None
-    logger.info("[SII] Solicitando resolución a 2Captcha (reCAPTCHA v3 Enterprise)...")
-    payload = {
-        "clientKey": API_KEY_2CAPTCHA,
-        "task": {
-            "type": "RecaptchaV3TaskProxyless",
-            "websiteURL": website_url,
-            "websiteKey": website_key,
-            "minScore": 0.3,
-            "pageAction": SII_RECAPTCHA_PAGE_ACTION,
-            "isEnterprise": True,
-        },
-    }
-    try:
-        res = requests.post("https://api.2captcha.com/createTask", json=payload, timeout=30).json()
-        if res.get("errorId") != 0:
-            logger.error("[SII] Error 2captcha createTask: %s", res)
-            return None
-        task_id = res.get("taskId")
-        max_attempts = 60
-        for attempt in range(max_attempts):
-            time.sleep(5)
-            status = requests.post(
-                "https://api.2captcha.com/getTaskResult",
-                json={"clientKey": API_KEY_2CAPTCHA, "taskId": task_id},
-                timeout=30,
-            ).json()
-            if status.get("status") == "ready":
-                token = status.get("solution", {}).get("gRecaptchaResponse")
-                logger.info("[SII] reCAPTCHA resuelto por 2Captcha")
-                return token
-            if status.get("errorId") != 0:
-                logger.error("[SII] Error 2captcha getTaskResult: %s", status)
-                return None
-            if attempt % 6 == 0:
-                logger.info("[SII] Esperando resolución reCAPTCHA... (%ds)", (attempt + 1) * 5)
-        logger.error("[SII] Timeout esperando resolución reCAPTCHA")
-        return None
-    except Exception as e:
-        logger.exception("[SII] Error al resolver reCAPTCHA: %s", e)
-        return None
-
-
-def _inyectar_token_captcha(driver, token: str) -> None:
-    """Inyecta token reCAPTCHA (v2 o v3) y ejecuta callbacks."""
-    logger.info("[SII] Inyectando token reCAPTCHA...")
-    script_js = """
-    var token = arguments[0];
-    try {
-        var area = document.getElementById('g-recaptcha-response');
-        if (area) { area.value = token; area.innerHTML = token; }
-        document.querySelectorAll('input[name="g-recaptcha-response"], input[id="g-recaptcha-response"], textarea[name="g-recaptcha-response"]').forEach(function(el) { el.value = token; });
-        if (typeof (___grecaptcha_cfg) !== 'undefined') {
-            for (let i in ___grecaptcha_cfg.clients) {
-                let client = ___grecaptcha_cfg.clients[i];
-                for (let prop in client) {
-                    if (client[prop] && typeof client[prop].callback === 'function') {
-                        client[prop].callback(token);
-                    }
-                }
-            }
-        }
-        if (typeof grecaptcha !== 'undefined' && grecaptcha.enterprise) {
-            try { grecaptcha.enterprise.getResponse && grecaptcha.enterprise.getResponse(); } catch(e){}
-        }
-    } catch (e) { console.error(e); }
-    """
-    driver.execute_script(script_js, token)
-    driver.execute_script(
-        """
-        var t = arguments[0];
-        var el = document.getElementById('g-recaptcha-response');
-        if (el) {
-            el.value = t;
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-        }
-    """,
-        token,
-    )
-    logger.info("[SII] Token reCAPTCHA inyectado")
-
-
-def _obtener_sitekey_sii(driver) -> Optional[str]:
-    """Obtiene el sitekey de reCAPTCHA del SII desde la página o env."""
-    if SII_RECAPTCHA_SITEKEY:
-        return SII_RECAPTCHA_SITEKEY
-    try:
-        # Prioridad 1: sitekey con el que se cargó el script (render= en enterprise.js o api.js)
-        sitekey = driver.execute_script(
-            """
-            var scripts = document.getElementsByTagName('script');
-            var enterpriseKey = null;
-            var anyKey = null;
-            for (var i = 0; i < scripts.length; i++) {
-                var src = (scripts[i].src || '').toString();
-                if (src.indexOf('recaptcha') === -1 || src.indexOf('render=') === -1) continue;
-                var m = src.match(/render=([^&]+)/);
-                if (m && m[1]) {
-                    if (src.indexOf('enterprise') !== -1) return m[1];
-                    if (!anyKey) anyKey = m[1];
-                }
-            }
-            return anyKey;
-            """
-        )
-        if (sitekey or "").strip():
-            return (sitekey or "").strip()
-        # Prioridad 2: data-sitekey en el DOM
-        sitekey = driver.execute_script(
-            """
-            var el = document.querySelector('[data-sitekey]');
-            if (el) return el.getAttribute('data-sitekey');
-            if (typeof ___grecaptcha_cfg !== 'undefined') {
-                var clients = ___grecaptcha_cfg.clients || {};
-                for (var k in clients) {
-                    var c = clients[k];
-                    if (c && c.K && c.K.sitekey) return c.K.sitekey;
-                }
-            }
-            return null;
-        """
-        )
-        if (sitekey or "").strip():
-            return (sitekey or "").strip()
-        # Fallback: buscar en el HTML (reCAPTCHA sitekeys suelen ser 6L + ~40 caracteres)
-        page_source = driver.page_source or ""
-        match = re.search(r'6L[a-zA-Z0-9_-]{38,52}', page_source)
-        if match:
-            return match.group(0)
-    except Exception as e:
-        logger.warning("[SII] No se pudo obtener sitekey del DOM: %s", e)
-    return SII_RECAPTCHA_SITEKEY_DEFAULT or None
-
-
-def _obtener_token_desde_navegador(driver, sitekey: str) -> Optional[str]:
-    """
-    Obtiene el token reCAPTCHA llamando grecaptcha.enterprise.execute() en el mismo
-    navegador que tiene la página del SII. El token es válido porque Google lo generó
-    en ese mismo contexto (misma IP, mismo navegador). No usa 2Captcha.
-    """
-    if not sitekey or not sitekey.strip():
-        return None
-    try:
-        # grecaptcha.enterprise.ready() + execute() pueden tardar con proxy; timeout 45 s
-        driver.set_script_timeout(45)
-        token = driver.execute_async_script(
-                """
-                var sitekey = arguments[0];
-                var action = arguments[1];
-                var callback = arguments[arguments.length - 1];
-                var done = false;
-                function finish(t) {
-                    if (done) return;
-                    done = true;
-                    callback(t || null);
-                }
-                setTimeout(function() { finish(null); }, 40000);
-                if (typeof grecaptcha === 'undefined' || !grecaptcha.enterprise) {
-                    finish(null);
-                    return;
-                }
-                function run() {
-                    if (typeof grecaptcha.enterprise.execute !== 'function') {
-                        finish(null);
-                        return;
-                    }
-                    grecaptcha.enterprise.execute(sitekey, { action: action })
-                        .then(function(t) { finish(t || null); })
-                        .catch(function(err) { finish(null); });
-                }
-                if (typeof grecaptcha.enterprise.ready === 'function') {
-                    grecaptcha.enterprise.ready(run);
-                } else {
-                    run();
-                }
-                """,
-                sitekey.strip(),
-                SII_RECAPTCHA_PAGE_ACTION,
-            )
-        if token and isinstance(token, str) and len(token) > 20:
-            return token
-    except Exception as e:
-        logger.warning("[SII] No se pudo obtener token desde el navegador (grecaptcha.enterprise.execute): %s", e)
-    return None
-
-
+# ----------------------------
+# Limpieza de memoria / disco (mantener)
+# ----------------------------
 def _cleanup_old_sessions() -> int:
     """
     Borra directorios de sesión Chrome en VM_TEMP_BASE más viejos que VM_CLEANUP_MAX_AGE_MINUTES.
-    Útil cuando un run crasheó sin hacer cleanup. Devuelve cantidad de directorios eliminados.
+    Devuelve cantidad de directorios eliminados.
     """
     if not VM_TEMP_BASE.exists():
         return 0
@@ -430,20 +204,62 @@ def _maybe_run_periodic_cleanup() -> None:
             logger.warning("Error en limpieza periódica VM: %s", e)
 
 
+# ----------------------------
+# MODELS
+# ----------------------------
+class GirosRequest(BaseModel):
+    rut: str
+
+
+def _normalizar_rut(rut: str) -> str:
+    """Quita puntos y deja formato 12345678-9."""
+    if not rut:
+        return ""
+    s = rut.strip().upper().replace(".", "").replace(" ", "")
+    if "-" not in s and len(s) >= 2 and s[-1] in "0123456789K":
+        return f"{s[:-1]}-{s[-1]}"
+    return s
+
+
+def _rut_num_y_dv(rut_normalizado: str) -> tuple:
+    """Devuelve (numero_sin_dv, dv) para la API getConsultaData."""
+    if not rut_normalizado or "-" not in rut_normalizado:
+        return ("", "")
+    num, dv = rut_normalizado.rsplit("-", 1)
+    return (num.replace(".", "").strip(), dv.strip().upper())
+
+
+def _parsear_fecha_sii(texto: str) -> Optional[datetime]:
+    """Intenta parsear fecha tipo dd-mm-yyyy o similar."""
+    if not texto or not texto.strip():
+        return None
+    texto = texto.strip()
+    m = re.match(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", texto)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return datetime(y, mo, d)
+        except ValueError:
+            return None
+    return None
+
+
+# ----------------------------
+# DRIVER (una sola vez al inicio)
+# ----------------------------
 def _crear_driver(headless: bool = True):
     """
-    Crea el driver de Chrome usando un directorio temporal propio que debe borrarse después.
-    Returns: (driver, temp_dir_path) o (None, None). Quien llama debe hacer driver.quit() y luego
-    shutil.rmtree(temp_dir_path, ignore_errors=True).
+    Crea el driver de Chrome usando un directorio temporal propio.
+    Returns: (driver, temp_dir_path) o (None, None).
     """
     if not SELENIUM_AVAILABLE:
         return None, None
     VM_TEMP_BASE.mkdir(parents=True, exist_ok=True)
-    session_dir = VM_TEMP_BASE / f"chrome_{uuid4().hex[:12]}"
+    session_dir_path = VM_TEMP_BASE / f"chrome_{uuid4().hex[:12]}"
     try:
-        session_dir.mkdir(parents=True, exist_ok=True)
+        session_dir_path.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        logger.error("No se pudo crear directorio de sesión %s: %s", session_dir, e)
+        logger.error("No se pudo crear directorio de sesión %s: %s", session_dir_path, e)
         return None, None
 
     options = Options()
@@ -453,406 +269,181 @@ def _crear_driver(headless: bool = True):
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    # Reducir detección de automatización (reCAPTCHA v3 puede dar mejor score)
     options.add_argument("--disable-blink-features=AutomationControlled")
-    # Reducir uso de disco: user-data-dir en nuestro temp y desactivar cachés
-    options.add_argument(f"--user-data-dir={session_dir}")
+    options.add_argument(f"--user-data-dir={session_dir_path}")
     options.add_argument("--disk-cache-size=0")
     options.add_argument("--disable-application-cache")
     options.add_argument("--no-first-run")
     options.add_argument("--no-default-browser-check")
+
     proxy_cfg = _get_proxy_config()
     if proxy_cfg:
-        # Proxy residencial (Oxylabs, etc.) requiere autenticación; Chrome no la soporta por argumento.
-        # Cargamos una extensión que inyecta user/pass en onAuthRequired (igual que gestion_documental).
         try:
             ext_path = _crear_proxy_auth_extension(
                 proxy_cfg["host"], proxy_cfg["port"],
                 proxy_cfg["username"], proxy_cfg["password"],
-                session_dir
+                session_dir_path
             )
-            # Igual que gestion_documental/verification_api: solo extensión, sin --proxy-server.
-            # La extensión configura el proxy con chrome.proxy.settings.set().
             options.add_argument(f"--load-extension={ext_path}")
             logger.info("[SII] Proxy residencial configurado (extensión auth): %s:%s", proxy_cfg["host"], proxy_cfg["port"])
         except Exception as e:
             logger.warning("[SII] No se pudo crear extensión de proxy, continuando sin proxy: %s", e)
     elif not SII_SCRAPER_USE_PROXY:
         logger.info("[SII] Proxy desactivado (SII_SCRAPER_USE_PROXY=false)")
+
     try:
         service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-        # Con proxy la carga puede ser más lenta; timeouts largos evitan fallos sin mensaje
-        driver.set_page_load_timeout(60)
-        driver.implicitly_wait(5)
-        return driver, session_dir
+        dr = webdriver.Chrome(service=service, options=options)
+        dr.set_page_load_timeout(60)
+        dr.set_script_timeout(45)
+        dr.implicitly_wait(5)
+        return dr, session_dir_path
     except Exception as e:
         logger.exception("Error creando Chrome driver: %s", e)
         try:
-            shutil.rmtree(session_dir, ignore_errors=True)
+            shutil.rmtree(session_dir_path, ignore_errors=True)
         except Exception:
             pass
         return None, None
 
 
-def _extraer_giros_sii(rut: str) -> Dict[str, Any]:
+def iniciar_navegador() -> None:
+    """Inicializa el navegador global una sola vez y carga la página del SII."""
+    global driver, session_dir
+    driver, session_dir = _crear_driver(headless=True)
+    if not driver:
+        logger.error("[SII] No se pudo crear el driver Chrome")
+        return
+    driver.get(SII_CONSULTA_URL)
+    WebDriverWait(driver, 30).until(
+        lambda d: d.execute_script("return window.grecaptcha && window.grecaptcha.enterprise")
+    )
+    logger.info("[SII] Navegador SII listo")
+
+
+# ----------------------------
+# GENERADOR DE TOKENS (thread)
+# ----------------------------
+def token_generator() -> None:
+    """Thread que genera tokens reCAPTCHA y los pone en token_queue."""
+    global driver
+    sitekey = (SII_RECAPTCHA_SITEKEY or SII_RECAPTCHA_SITEKEY_DEFAULT or "").strip()
+    if not sitekey:
+        sitekey = SII_RECAPTCHA_SITEKEY_DEFAULT
+    while True:
+        try:
+            if token_queue.full():
+                time.sleep(1)
+                continue
+            if not driver:
+                time.sleep(2)
+                continue
+            token = driver.execute_async_script(
+                """
+                const sitekey = arguments[0];
+                const action = arguments[1];
+                const callback = arguments[arguments.length - 1];
+                function finish(t) { callback(t || null); }
+                if (typeof grecaptcha === 'undefined' || !grecaptcha.enterprise) {
+                    finish(null);
+                    return;
+                }
+                grecaptcha.enterprise.ready(function() {
+                    grecaptcha.enterprise.execute(sitekey, { action: action })
+                        .then(function(t) { finish(t); })
+                        .catch(function() { finish(null); });
+                });
+                """,
+                sitekey,
+                SII_RECAPTCHA_PAGE_ACTION,
+            )
+            if token and isinstance(token, str) and len(token) > 20:
+                token_queue.put(token)
+        except Exception as e:
+            logger.error("[SII] Error generando token: %s", e)
+            time.sleep(2)
+
+
+# ----------------------------
+# CONSULTA API SII (requests, sin Chrome por RUT)
+# ----------------------------
+def _consultar_sii_api(rut: str) -> Dict[str, Any]:
     """
-    Abre SII, ingresa RUT, extrae tabla de actividades económicas.
-    Usa un directorio temporal por sesión que se borra al terminar para no llenar el disco.
+    Consulta el API getConsultaData del SII usando un token de la cola y requests.
+    Mismo proxy que Selenium (Oxylabs) si está configurado.
     Returns: {"success", "activities", "not_found", "error"}
     """
     rut = _normalizar_rut(rut)
     if not rut:
-        logger.info("[SII] RUT vacío o inválido, rechazando")
         return {"success": False, "activities": [], "not_found": False, "error": "RUT vacío o inválido"}
 
-    rut_para_sii = _rut_con_puntos(rut)
-    logger.info("[SII] Inicio extracción RUT normalizado=%s, enviando al formulario=%s", rut, rut_para_sii)
-
-    _maybe_run_periodic_cleanup()
-
-    driver, session_dir = _crear_driver(headless=True)
-    if not driver:
-        logger.error("[SII] No se pudo crear el driver Chrome")
-        return {"success": False, "activities": [], "not_found": False, "error": "Driver Chrome no disponible"}
-
-    activities = []
-    not_found = False
-    error_msg = None
+    rut_num, dv = _rut_num_y_dv(rut)
+    if not rut_num or not dv:
+        return {"success": False, "activities": [], "not_found": False, "error": "RUT inválido"}
 
     try:
-        driver.get(SII_CONSULTA_URL)
-        # Con proxy residencial la primera carga del SII puede tardar mucho; dar 60 s al input
-        wait = WebDriverWait(driver, 60)
+        token = token_queue.get(timeout=30)
+    except queue.Empty:
+        logger.error("[SII] Timeout esperando token de la cola")
+        return {"success": False, "activities": [], "not_found": False, "error": "No hay tokens reCAPTCHA disponibles (timeout)"}
 
-        # Ingresar RUT en formato que espera el SII: 17.807.161-0 (con puntos de miles)
-        input_rut = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input.rut-form")))
-        time.sleep(1)
+    payload = {
+        "rut": rut_num,
+        "dv": dv,
+        "reAction": SII_RECAPTCHA_PAGE_ACTION,
+        "reToken": token,
+    }
 
-        input_rut.clear()
-        input_rut.send_keys(rut_para_sii)
-        logger.info("[SII] RUT escrito en input: %s", rut_para_sii)
-        time.sleep(0.5)
-
-        sitekey = _obtener_sitekey_sii(driver)
-        # Esperar a que reCAPTCHA cargue (necesario antes de grecaptcha.enterprise.execute)
-        wait_recaptcha = WebDriverWait(driver, 15)
-        wait_recaptcha.until(
-            lambda d: d.execute_script("return typeof window.grecaptcha !== 'undefined';")
+    proxies = _proxies_for_requests()
+    try:
+        r = requests.post(
+            SII_GET_CONSULTA_DATA_URL,
+            json=payload,
+            timeout=20,
+            proxies=proxies,
         )
-        wait_recaptcha.until(
-            lambda d: d.execute_script("return typeof window.grecaptcha.enterprise !== 'undefined';")
-        )
+        r.raise_for_status()
+        data = r.json()
+    except requests.RequestException as e:
+        logger.warning("[SII] Error request getConsultaData: %s", e)
+        return {"success": False, "activities": [], "not_found": False, "error": str(e)}
 
-        # 1) Primera opción: token generado por el mismo navegador (sin 2Captcha)
-        if sitekey:
-            token_browser = _obtener_token_desde_navegador(driver, sitekey)
-            if token_browser:
-                logger.info("[SII] Token obtenido desde el propio navegador (grecaptcha.enterprise.execute)")
-                rut_num, dv = _rut_num_y_dv(rut)
-                if rut_num and dv:
-                    try:
-                        api_result = driver.execute_async_script(
-                            """
-                            var rutNum = arguments[0];
-                            var dv = arguments[1];
-                            var token = arguments[2];
-                            var callback = arguments[arguments.length - 1];
-                            fetch('https://www2.sii.cl/app/stc/recurso/v1/consulta/getConsultaData/', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({
-                                    rut: rutNum,
-                                    dv: dv,
-                                    reAction: 'consultaSTC',
-                                    reToken: token
-                                })
-                            })
-                            .then(function(r) { return r.json(); })
-                            .then(function(data) { callback(data); })
-                            .catch(function(err) { callback({ captchaInvalido: true, error: err.toString() }); });
-                            """,
-                            rut_num,
-                            dv,
-                            token_browser,
-                        )
-                        if isinstance(api_result, dict) and api_result.get("captchaInvalido") is False:
-                            giros = api_result.get("girosNegocio") or []
-                            for g in giros:
-                                activities.append({
-                                    "code": str(g.get("codigo", "")).strip(),
-                                    "description": str(g.get("descripcion", "")).strip(),
-                                    "category": str(g.get("categoriaTributaria", "")).strip(),
-                                    "isVatSubject": str(g.get("indicadorAfectoIva", "")).upper() in ("SI", "SÍ"),
-                                    "fecha": str(g.get("fechaInicio", "")).strip(),
-                                    "startDate": _parsear_fecha_sii(str(g.get("fechaInicio", ""))),
-                                    "lastUpdatedAt": datetime.utcnow(),
-                                })
-                            logger.info("[SII] RUT %s: %d actividades desde API getConsultaData (token del navegador)", rut, len(activities))
-                            return {
-                                "success": True,
-                                "activities": activities,
-                                "not_found": not activities,
-                                "error": None,
-                            }
-                        if isinstance(api_result, dict) and api_result.get("captchaInvalido") is True:
-                            logger.info("[SII] Token del navegador rechazado (captchaInvalido=true), se usará 2Captcha como respaldo")
-                    except Exception as api_err:
-                        logger.warning("[SII] Error llamando API getConsultaData con token del navegador: %s", api_err)
-            else:
-                logger.info("[SII] No se pudo obtener token desde el navegador, se usará 2Captcha")
+    if data.get("captchaInvalido") is True:
+        logger.warning("[SII] API devolvió captchaInvalido=true para RUT %s", rut)
+        return {"success": False, "activities": [], "not_found": False, "error": "reCAPTCHA rechazado por el SII"}
 
-        # 2) Respaldo: override de execute() y 2Captcha (para cuando headless/proxy hace que Google rechace el token del navegador)
-        driver.execute_script(
-            """
-            window.__SII_RECAPTCHA_TOKEN = null;
-            var check = setInterval(function() {
-                if (window.grecaptcha && window.grecaptcha.enterprise) {
-                    clearInterval(check);
-                    try {
-                        Object.defineProperty(window.grecaptcha.enterprise, 'execute', {
-                            get: function() {
-                                return function() { return Promise.resolve(window.__SII_RECAPTCHA_TOKEN || ''); };
-                            },
-                            configurable: true,
-                            enumerable: true
-                        });
-                    } catch (e) {}
-                }
-            }, 200);
-            """
-        )
-        time.sleep(0.5)
+    giros = data.get("girosNegocio") or []
+    activities = []
+    for g in giros:
+        activities.append({
+            "code": str(g.get("codigo", "")).strip(),
+            "description": str(g.get("descripcion", "")).strip(),
+            "category": str(g.get("categoriaTributaria", "")).strip(),
+            "isVatSubject": str(g.get("indicadorAfectoIva", "")).upper() in ("SI", "SÍ"),
+            "fecha": str(g.get("fechaInicio", "")).strip(),
+            "startDate": _parsear_fecha_sii(str(g.get("fechaInicio", ""))),
+            "lastUpdatedAt": datetime.utcnow(),
+        })
 
-        # Resolver reCAPTCHA con 2Captcha antes de enviar (mismo esquema que gestion_documental)
-        if API_KEY_2CAPTCHA and sitekey:
-            for _ in range(3):
-                loaded = driver.execute_script(
-                    "return typeof grecaptcha !== 'undefined' || (typeof window.grecaptcha !== 'undefined' && window.grecaptcha && window.grecaptcha.enterprise);"
-                )
-                if loaded:
-                    break
-                time.sleep(3)
-            token = _resolver_captcha_2captcha(SII_CONSULTA_URL, sitekey)
-            if token:
-                _inyectar_token_captcha(driver, token)
-                try:
-                    driver.execute_script("window.__SII_RECAPTCHA_TOKEN = arguments[0];", token)
-                    logger.info("[SII] Token asignado a __SII_RECAPTCHA_TOKEN para execute()")
-                except Exception as ex:
-                    logger.warning("[SII] No se pudo asignar token global: %s", ex)
-                time.sleep(1)
-                # Llamar directamente a la API del SII (mismo endpoint que usa el front al hacer click)
-                rut_num, dv = _rut_num_y_dv(rut)
-                if rut_num and dv:
-                    try:
-                        api_result = driver.execute_async_script(
-                            """
-                            var rutNum = arguments[0];
-                            var dv = arguments[1];
-                            var token = arguments[2];
-                            var callback = arguments[arguments.length - 1];
-                            fetch('https://www2.sii.cl/app/stc/recurso/v1/consulta/getConsultaData/', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({
-                                    rut: rutNum,
-                                    dv: dv,
-                                    reAction: 'consultaSTC',
-                                    reToken: token
-                                })
-                            })
-                            .then(function(r) { return r.json(); })
-                            .then(function(data) { callback(data); })
-                            .catch(function(err) { callback({ captchaInvalido: true, error: err.toString() }); });
-                            """,
-                            rut_num,
-                            dv,
-                            token,
-                        )
-                        if isinstance(api_result, dict) and api_result.get("captchaInvalido") is False:
-                            giros = api_result.get("girosNegocio") or []
-                            for g in giros:
-                                activities.append({
-                                    "code": str(g.get("codigo", "")).strip(),
-                                    "description": str(g.get("descripcion", "")).strip(),
-                                    "category": str(g.get("categoriaTributaria", "")).strip(),
-                                    "isVatSubject": str(g.get("indicadorAfectoIva", "")).upper() in ("SI", "SÍ"),
-                                    "fecha": str(g.get("fechaInicio", "")).strip(),
-                                    "startDate": _parsear_fecha_sii(str(g.get("fechaInicio", ""))),
-                                    "lastUpdatedAt": datetime.utcnow(),
-                                })
-                            logger.info("[SII] RUT %s: %d actividades desde API getConsultaData", rut, len(activities))
-                            # Éxito vía API; salir del try principal sin click ni scrape
-                            return {
-                                "success": True,
-                                "activities": activities,
-                                "not_found": not activities,
-                                "error": None,
-                            }
-                        if isinstance(api_result, dict) and api_result.get("captchaInvalido") is True:
-                            logger.warning(
-                                "[SII] API getConsultaData devolvió captchaInvalido=true (el backend del SII valida el token con Google; 2Captcha lo genera desde otra IP). Respuesta: %s",
-                                {k: v for k, v in api_result.items() if k != "reToken"},
-                            )
-                    except Exception as api_err:
-                        logger.warning("[SII] Error llamando API getConsultaData: %s", api_err)
-                time.sleep(1)
-            else:
-                logger.warning("[SII] 2Captcha no devolvió token, continuando sin él (puede fallar por ReCaptcha)")
-        elif not sitekey:
-            logger.info(
-                "[SII] No se detectó sitekey de reCAPTCHA en la página. "
-                "Defina SII_RECAPTCHA_SITEKEY en el servicio (inspeccionar la página del SII en el navegador)."
-            )
-            try:
-                debug_dir = VM_TEMP_BASE / "debug"
-                debug_dir.mkdir(parents=True, exist_ok=True)
-                path = debug_dir / "sii_page_for_sitekey.html"
-                (path).write_text(driver.page_source or "", encoding="utf-8", errors="replace")
-                logger.info("[SII] HTML guardado en %s — ejecute: grep -oE '6L[a-zA-Z0-9_-]{38,52}' %s | head -1", path, path)
-            except Exception as ex:
-                logger.warning("[SII] No se pudo guardar HTML para sitekey: %s", ex)
+    registrado = data.get("registrado", True)
+    tiene_giros = data.get("tieneGirosNegocio", True)
+    not_found = not activities and (not registrado or not tiene_giros)
 
-        # Consultar Situación Tributaria
-        btn_consultar = wait.until(
-            EC.element_to_be_clickable((By.XPATH, "//input[@value='Consultar Situación Tributaria']"))
-        )
-        driver.execute_script("arguments[0].scrollIntoView(true);", btn_consultar)
-        driver.execute_script("arguments[0].click();", btn_consultar)
-        logger.info("[SII] Click en Consultar Situación Tributaria, esperando carga...")
-        time.sleep(6)  # SPA: dar tiempo a que el SII renderice resultados (proxy/headless puede ser lento)
-
-        # Detección de rechazo por reCAPTCHA (SII bloquea headless/proxy)
-        page_source = driver.page_source or ""
-        if "no autorizado por ReCaptcha" in page_source or "usuario no autorizado por ReCaptcha" in page_source:
-            logger.warning("[SII] RUT %s: SII rechazó la consulta por reCAPTCHA (headless/proxy detectado)", rut)
-            try:
-                debug_dir = VM_TEMP_BASE / "debug"
-                debug_dir.mkdir(parents=True, exist_ok=True)
-                (debug_dir / "sii_no_open_btn.html").write_text(page_source, encoding="utf-8", errors="replace")
-                (debug_dir / "sii_no_open_btn_url.txt").write_text(driver.current_url or "", encoding="utf-8")
-            except Exception as ex:
-                logger.warning("[SII] No se pudo guardar debug: %s", ex)
-            logger.warning(
-                "[SII] RUT %s: resultado success=False not_found=True por ReCaptcha (SII rechazó headless/proxy). Pruebe SII_SCRAPER_USE_PROXY=false para validar.",
-                rut,
-            )
-            return {
-                "success": False,
-                "activities": [],
-                "not_found": True,
-                "error": "SII rechazó la consulta: usuario no autorizado por ReCaptcha (headless o proxy detectado). Ver documentación README_VM.md.",
-            }
-
-        # Botón desplegar actividades (en headless + proxy puede tardar bastante)
-        btn_desplegar_clicked = False
-        try:
-            btn_desplegar = WebDriverWait(driver, 30).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "button.open-btn"))
-            )
-            driver.execute_script("arguments[0].click();", btn_desplegar)
-            logger.info("[SII] Botón desplegar actividades encontrado y clickeado")
-            btn_desplegar_clicked = True
-        except Exception as e:
-            logger.warning("[SII] No se encontró botón open-btn para RUT %s, intentando tabla directa: %s", rut, e)
-            try:
-                debug_dir = VM_TEMP_BASE / "debug"
-                debug_dir.mkdir(parents=True, exist_ok=True)
-                (debug_dir / "sii_no_open_btn.html").write_text(driver.page_source or "", encoding="utf-8", errors="replace")
-                (debug_dir / "sii_no_open_btn_url.txt").write_text(driver.current_url or "", encoding="utf-8")
-                logger.info("[SII] Debug: HTML guardado en %s/sii_no_open_btn.html", debug_dir)
-            except Exception as ex:
-                logger.warning("[SII] No se pudo guardar debug (no open-btn): %s", ex)
-
-        # Tabla de actividades (puede estar ya visible sin click en open-btn)
-        try:
-            wait.until(EC.visibility_of_element_located((By.ID, "DataTables_Table_0")))
-        except Exception as e:
-            if not btn_desplegar_clicked:
-                logger.warning("[SII] RUT %s: tampoco se encontró tabla DataTables_Table_0 (sin actividades en SII)", rut)
-                not_found = True
-                return {"success": True, "activities": [], "not_found": not_found, "error": None}
-            raise
-        time.sleep(1.5)
-
-        filas = driver.find_elements(By.CSS_SELECTOR, "#DataTables_Table_0 tbody tr")
-        logger.info("[SII] Tabla DataTables_Table_0 visible, filas encontradas: %d", len(filas))
-        for fila in filas:
-            columnas = fila.find_elements(By.TAG_NAME, "td")
-            if len(columnas) >= 6:
-                descripcion = columnas[1].text.strip()
-                codigo = columnas[2].text.strip()
-                categoria = columnas[3].text.strip()
-                afecta_iva = columnas[4].text.strip().upper()
-                fecha_texto = columnas[5].text.strip()
-                activities.append({
-                    "code": codigo,
-                    "description": descripcion,
-                    "category": categoria,
-                    "isVatSubject": "SI" in afecta_iva or "SÍ" in afecta_iva,
-                    "fecha": fecha_texto,
-                    "startDate": _parsear_fecha_sii(fecha_texto),
-                    "lastUpdatedAt": datetime.utcnow(),
-                })
-
-        if not activities and filas:
-            logger.warning("[SII] RUT %s: hay %d filas pero ninguna con >=6 columnas (revisar estructura tabla)", rut, len(filas))
-        elif not activities:
-            logger.warning("[SII] RUT %s: tabla visible pero 0 filas de actividades", rut)
-        else:
-            logger.info("[SII] RUT %s: extraídas %d actividades correctamente", rut, len(activities))
-
-    except Exception as e:
-        error_type = type(e).__name__
-        error_detail = getattr(e, "msg", None) or (e.args[0] if e.args else str(e))
-        err_str = str(e)
-        logger.exception(
-            "[SII] Error extrayendo giros para %s: %s - %s (detalle: %s)",
-            rut, error_type, error_detail, e.args
-        )
-        # Chrome/driver murió (Connection refused) — suele ser OOM o muchas peticiones a la vez
-        if "Connection refused" in err_str or "MaxRetryError" in err_str:
-            error_msg = "Chrome/driver se cerró inesperadamente (posible falta de memoria en la VM). Evite lanzar muchas consultas a la vez."
-        else:
-            error_msg = err_str or f"{error_type}: {error_detail}"
-        not_found = "no se encontró" in err_str.lower() or "not found" in err_str.lower()
-        # En timeout de la primera carga, guardar HTML y URL para ver qué recibió Chrome (proxy/página)
-        if error_type == "TimeoutException" and driver:
-            try:
-                debug_dir = VM_TEMP_BASE / "debug"
-                debug_dir.mkdir(parents=True, exist_ok=True)
-                path_html = debug_dir / "sii_last_timeout.html"
-                path_url = debug_dir / "sii_last_timeout_url.txt"
-                path_html.write_text(driver.page_source or "", encoding="utf-8", errors="replace")
-                path_url.write_text(driver.current_url or "", encoding="utf-8")
-                logger.warning("[SII] Debug: guardado %s y %s (revisar qué cargó Chrome)", path_html, path_url)
-            except Exception as ex:
-                logger.warning("[SII] No se pudo guardar debug: %s", ex)
-    finally:
-        try:
-            driver.quit()
-        except Exception as e:
-            logger.warning("Error al cerrar driver: %s", e)
-        # Liberar espacio: borrar directorio de sesión de Chrome (caché, user data, etc.)
-        if session_dir and session_dir.exists():
-            try:
-                shutil.rmtree(session_dir, ignore_errors=True)
-            except Exception as e:
-                logger.warning("No se pudo borrar sesión %s: %s", session_dir, e)
-
-    logger.info("[SII] RUT %s resultado: success=%s, activities=%d, not_found=%s, error=%s", rut, error_msg is None, len(activities), not_found, error_msg)
+    logger.info("[SII] RUT %s: %d actividades desde API (token pool)", rut, len(activities))
     return {
-        "success": error_msg is None,
+        "success": True,
         "activities": activities,
         "not_found": not_found,
-        "error": error_msg,
+        "error": None,
     }
 
 
+# ----------------------------
+# STARTUP / SHUTDOWN
+# ----------------------------
 @app.on_event("startup")
-def startup_cleanup():
-    """Al iniciar la API, borrar sesiones Chrome viejas (p. ej. de un reinicio tras crash)."""
+def startup():
+    """Al iniciar: limpieza de sesiones viejas, un navegador, y thread generador de tokens."""
     try:
         removed = _cleanup_old_sessions()
         if removed > 0:
@@ -861,7 +452,38 @@ def startup_cleanup():
     except Exception as e:
         logger.warning("Limpieza al inicio: %s", e)
 
+    iniciar_navegador()
+    if driver:
+        t = threading.Thread(target=token_generator, daemon=True)
+        t.start()
+        logger.info("[SII] Generador de tokens iniciado")
+    else:
+        logger.error("[SII] No se pudo iniciar navegador; /giros fallará hasta reinicio")
 
+
+@app.on_event("shutdown")
+def shutdown():
+    """Al apagar: cerrar navegador y borrar directorio de sesión (limpieza de memoria)."""
+    global driver, session_dir
+    if driver:
+        try:
+            driver.quit()
+            logger.info("[SII] Navegador cerrado")
+        except Exception as e:
+            logger.warning("Error al cerrar driver: %s", e)
+        driver = None
+    if session_dir and session_dir.exists():
+        try:
+            shutil.rmtree(session_dir, ignore_errors=True)
+            logger.info("[SII] Sesión borrada: %s", session_dir)
+        except Exception as e:
+            logger.warning("No se pudo borrar sesión %s: %s", session_dir, e)
+        session_dir = None
+
+
+# ----------------------------
+# ENDPOINTS
+# ----------------------------
 @app.get("/health")
 async def health():
     return {"status": "healthy", "service": "sii-scraper-vm", "selenium": SELENIUM_AVAILABLE}
@@ -871,7 +493,6 @@ async def health():
 async def cleanup_disk():
     """
     Fuerza limpieza de directorios de sesión antiguos (liberar espacio).
-    Útil si el disco se llenó o quieres liberar sin esperar al próximo ciclo.
     """
     try:
         removed = _cleanup_old_sessions()
@@ -885,15 +506,26 @@ async def cleanup_disk():
 async def obtener_giros(body: GirosRequest) -> Dict[str, Any]:
     """
     Consulta el SII por RUT y devuelve la lista de actividades económicas (giros).
-    Ejecuta el scraping en esta VM para no exponer la IP de Cloud Run.
+    Usa 1 navegador + cola de tokens + requests (sin abrir Chrome por RUT).
     """
     rut = (body.rut or "").strip()
     if not rut:
         raise HTTPException(status_code=400, detail="rut es requerido")
 
+    _maybe_run_periodic_cleanup()
+
+    if not driver:
+        raise HTTPException(status_code=503, detail="Scraper no disponible (navegador no iniciado)")
+
     logger.info("[SII] POST /giros recibido RUT=%s", rut)
-    result = _extraer_giros_sii(rut)
+    result = _consultar_sii_api(rut)
     logger.info("[SII] POST /giros RUT=%s -> success=%s activities=%d not_found=%s", rut, result["success"], len(result.get("activities", [])), result.get("not_found"))
+
+    if result.get("error") and "captcha" in result["error"].lower():
+        raise HTTPException(status_code=429, detail=result["error"])
+    if result.get("error") and "timeout" in result["error"].lower():
+        raise HTTPException(status_code=503, detail=result["error"])
+
     return {
         "rut": _normalizar_rut(rut),
         "activities": result["activities"],
