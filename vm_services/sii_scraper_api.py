@@ -196,11 +196,12 @@ def _resolver_captcha_2captcha(website_url: str, website_key: str) -> Optional[s
     payload = {
         "clientKey": API_KEY_2CAPTCHA,
         "task": {
-            "type": "RecaptchaV3EnterpriseTaskProxyless",
+            "type": "RecaptchaV3TaskProxyless",
             "websiteURL": website_url,
             "websiteKey": website_key,
             "minScore": 0.3,
             "pageAction": SII_RECAPTCHA_PAGE_ACTION,
+            "isEnterprise": True,
         },
     }
     try:
