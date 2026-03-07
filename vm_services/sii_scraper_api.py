@@ -146,21 +146,20 @@ def _capsolver_proxy_string() -> Optional[str]:
 def _get_token_capsolver() -> Optional[str]:
     """
     Obtiene un token reCAPTCHA v3 Enterprise vía CapSolver.
-    Usa proxy Oxylabs si está configurado (ReCaptchaV3EnterpriseTask), si no ProxyLess.
+    Usamos ProxyLess porque los workers de CapSolver no pueden usar proxy Oxylabs
+    (Oxylabs suele aceptar solo la IP del cliente). La petición al SII sigue yendo por Oxylabs.
     """
     if not CAPSOLVER_API_KEY:
         return None
     sitekey = (SII_RECAPTCHA_SITEKEY or SII_RECAPTCHA_SITEKEY_DEFAULT or "").strip() or SII_RECAPTCHA_SITEKEY_DEFAULT
+    # ProxyLess: CapSolver resuelve desde su IP. Si usamos proxy, Oxylabs rechaza la conexión desde sus workers.
     task = {
         "type": "ReCaptchaV3EnterpriseTaskProxyLess",
         "websiteURL": SII_CONSULTA_URL,
         "websiteKey": sitekey,
         "pageAction": SII_RECAPTCHA_PAGE_ACTION,
     }
-    proxy_str = _capsolver_proxy_string()
-    if proxy_str:
-        task["type"] = "ReCaptchaV3EnterpriseTask"
-        task["proxy"] = proxy_str
+    proxy_str = None  # no pasar proxy a CapSolver
 
     create_url = f"{CAPSOLVER_API_URL}/createTask"
     result_url = f"{CAPSOLVER_API_URL}/getTaskResult"
