@@ -79,7 +79,7 @@ SII_RECAPTCHA_PAGE_ACTION = os.getenv("SII_RECAPTCHA_PAGE_ACTION", "consultaSTC"
 CAPSOLVER_API_KEY = (os.getenv("CAPSOLVER_API_KEY") or "").strip()
 CAPSOLVER_API_URL = (os.getenv("CAPSOLVER_API_URL") or "https://api.capsolver.com").strip().rstrip("/")
 
-TOKEN_QUEUE_SIZE = int(os.getenv("TOKEN_QUEUE_SIZE", "100")) = int(os.getenv("TOKEN_QUEUE_SIZE", "100"))
+TOKEN_QUEUE_SIZE = int(os.getenv("TOKEN_QUEUE_SIZE", "100"))
 
 # Timeout para scripts en el navegador (reCAPTCHA con proxy puede ser lento). Aumentar si ves "script timeout".
 SCRIPT_TIMEOUT_SEC = int(os.getenv("SCRIPT_TIMEOUT_SEC", "120"))
