@@ -135,11 +135,12 @@ def _proxies_for_requests() -> Optional[Dict[str, str]]:
 
 
 def _capsolver_proxy_string() -> Optional[str]:
-    """Formato proxy para CapSolver: http://user:pass@host:port (Oxylabs)."""
+    """Formato proxy para CapSolver. Prueba host:port:user:pass (documentado por CapSolver)."""
     pc = _get_proxy_config()
     if not pc:
         return None
-    return f"http://{pc['username']}:{pc['password']}@{pc['host']}:{pc['port']}"
+    # Formato: http:host:port:user:pass (evita problemas con @ en URL)
+    return f"http:{pc['host']}:{pc['port']}:{pc['username']}:{pc['password']}"
 
 
 def _get_token_capsolver() -> Optional[str]:
@@ -165,7 +166,19 @@ def _get_token_capsolver() -> Optional[str]:
     result_url = f"{CAPSOLVER_API_URL}/getTaskResult"
     try:
         r = requests.post(create_url, json={"clientKey": CAPSOLVER_API_KEY, "task": task}, timeout=15)
-        r.raise_for_status()
+        if r.status_code != 200:
+            try:
+                err_body = r.json()
+                logger.warning(
+                    "[SII] CapSolver createTask %s: errorId=%s errorCode=%s errorDescription=%s",
+                    r.status_code,
+                    err_body.get("errorId"),
+                    err_body.get("errorCode"),
+                    err_body.get("errorDescription", r.text[:200]),
+                )
+            except Exception:
+                logger.warning("[SII] CapSolver createTask error: %s %s", r.status_code, r.text[:300])
+            return None
         data = r.json()
     except requests.RequestException as e:
         logger.warning("[SII] CapSolver createTask error: %s", e)
