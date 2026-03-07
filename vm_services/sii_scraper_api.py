@@ -22,6 +22,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
+from urllib.parse import quote
 
 import requests
 
@@ -126,11 +127,13 @@ def _get_proxy_config() -> Optional[Dict[str, str]]:
 
 
 def _proxies_for_requests() -> Optional[Dict[str, str]]:
-    """Proxies en formato requests (mismo proxy que Selenium para consistencia con Oxylabs)."""
+    """Proxies en formato requests. Usuario y contraseña codificados para evitar 401 con caracteres especiales."""
     pc = _get_proxy_config()
     if not pc:
         return None
-    url = f"http://{pc['username']}:{pc['password']}@{pc['host']}:{pc['port']}"
+    user = quote(pc["username"], safe="")
+    passwd = quote(pc["password"], safe="")
+    url = f"http://{user}:{passwd}@{pc['host']}:{pc['port']}"
     return {"http": url, "https": url}
 
 

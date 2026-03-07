@@ -282,20 +282,20 @@ El servicio **carrier-sii-scraper-shared-vm.service** ya usa `EnvironmentFile=/h
    cp env.proxy.example env.proxy
    nano env.proxy
    ```
-   Rellena `OXY_USER`, `OXY_PASS`, y si usas proxy residencial Chile: `OXY_HOST=pr.oxylabs.io`, `OXY_PORT=7777`.
+   Usa las **mismas credenciales Oxylabs que gestion_documental**: `OXY_USER=conirarra_FyqF8`, `OXY_PASS=...`, `OXY_HOST=unblock.oxylabs.io`, `OXY_PORT=60000`.
 3. Reinicia: `sudo systemctl restart carrier-sii-scraper`.
 
 A partir de ahí, para cambiar credenciales solo editas `env.proxy` y reinicias; no hace falta tocar el .service.
 
 **Opción B – Variables en systemd**
 
-En `systemctl edit --full carrier-sii-scraper`, bajo `[Service]` añade:
+Usa las **mismas credenciales Oxylabs que gestion_documental** (ver `gestion_documental/documentacion/README_VM.md`). En `systemctl edit --full carrier-sii-scraper`, bajo `[Service]` añade:
 
 ```ini
-Environment=OXY_USER=tu_usuario_oxylabs
-Environment=OXY_PASS=tu_password_oxylabs
-Environment=OXY_HOST=unblock.oxylabs.io
-Environment=OXY_PORT=60000
+Environment="OXY_USER=conirarra_FyqF8"
+Environment="OXY_PASS=Clemente_2011"
+Environment="OXY_HOST=unblock.oxylabs.io"
+Environment="OXY_PORT=60000"
 ```
 
 Luego: `sudo systemctl daemon-reload && sudo systemctl restart carrier-sii-scraper`. En logs: `[SII] Proxy residencial configurado (extensión auth): ...`.
