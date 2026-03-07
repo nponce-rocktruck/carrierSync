@@ -269,11 +269,23 @@ Si el SII bloquea la IP de la VM, usa el mismo proxy residencial que en gestion_
 
 **Opción A – Archivo de credenciales (recomendado, no sube secretos al repo)**
 
-1. En la VM: `cd ~/carrierSync`, `cp env.proxy.example env.proxy`, `nano env.proxy` y rellena `OXY_USER` y `OXY_PASS`.
-2. `sudo systemctl edit --full carrier-sii-scraper` y en `[Service]` añade una línea: `EnvironmentFile=/home/pc/carrierSync/env.proxy`
-3. `sudo systemctl daemon-reload && sudo systemctl restart carrier-sii-scraper`
+El servicio **carrier-sii-scraper-shared-vm.service** ya usa `EnvironmentFile=/home/pc/carrierSync/env.proxy`. Si en los logs ves `Proxy residencial configurado (UC): unblock.oxylabs.io:60000` en lugar de tu proxy (ej. `pr.oxylabs.io:7777`), en la VM está instalada la **versión antigua** del servicio (con `Environment=` sueltos). Actualiza así:
 
-El archivo `env.proxy` no se sube al repo (está en .gitignore). Si reclonas, vuelve a crear `env.proxy` desde `env.proxy.example`.
+1. En la VM, copia el .service del repo sobre el de systemd:
+   ```bash
+   cd ~/carrierSync && git pull
+   sudo cp scripts_vm/carrier-sii-scraper-shared-vm.service /etc/systemd/system/carrier-sii-scraper.service
+   sudo systemctl daemon-reload
+   ```
+2. Crea o edita `env.proxy` con tus valores (proxy, 2Captcha, opcionalmente `SCRIPT_TIMEOUT_SEC=180` si hay "script timeout"):
+   ```bash
+   cp env.proxy.example env.proxy
+   nano env.proxy
+   ```
+   Rellena `OXY_USER`, `OXY_PASS`, y si usas proxy residencial Chile: `OXY_HOST=pr.oxylabs.io`, `OXY_PORT=7777`.
+3. Reinicia: `sudo systemctl restart carrier-sii-scraper`.
+
+A partir de ahí, para cambiar credenciales solo editas `env.proxy` y reinicias; no hace falta tocar el .service.
 
 **Opción B – Variables en systemd**
 
@@ -290,7 +302,23 @@ Luego: `sudo systemctl daemon-reload && sudo systemctl restart carrier-sii-scrap
 
 ---
 
-## 7.3 reCAPTCHA: token del navegador (sin 2Captcha por defecto)
+## 7.2 CapSolver (reCAPTCHA v3 Enterprise) – recomendado
+
+Si configuras **CapSolver**, el scraper obtiene los tokens de reCAPTCHA vía API y **no inicia Chrome** (evita timeouts y uso de memoria).
+
+1. Crea cuenta y obtén tu API key en [CapSolver](https://dashboard.capsolver.com/).
+2. En `env.proxy` añade (con tu clave real):
+   ```ini
+   CAPSOLVER_API_KEY=CAP-tu_api_key_aqui
+   ```
+3. El proxy Oxylabs que ya tienes en `env.proxy` se usa también para CapSolver (misma IP al resolver y al llamar al SII).
+4. Reinicia: `sudo systemctl restart carrier-sii-scraper`. En logs debe aparecer `[SII] CapSolver configurado: tokens vía API (sin navegador)`.
+
+En cada consulta se pide un token a CapSolver (tipo `ReCaptchaV3EnterpriseTask` con proxy Oxylabs) y se llama al API del SII con ese token. No hace falta 2Captcha ni el navegador.
+
+---
+
+## 7.3 reCAPTCHA: token del navegador (sin CapSolver)
 
 **Por defecto el scraper no usa 2Captcha.** Solo intenta obtener el token desde el mismo navegador (`grecaptcha.enterprise.execute()` en la página del SII). Si Google acepta ese token, se llama a la API del SII y se devuelven los giros. Si no, se hace click en "Consultar Situación Tributaria" (en headless/proxy el SII suele mostrar "usuario no autorizado por ReCaptcha").
 

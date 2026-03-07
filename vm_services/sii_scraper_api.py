@@ -75,7 +75,14 @@ SII_CONSULTA_URL = "https://www2.sii.cl/stc/noauthz.html"
 SII_GET_CONSULTA_DATA_URL = "https://www2.sii.cl/app/stc/recurso/v1/consulta/getConsultaData/"
 SII_RECAPTCHA_PAGE_ACTION = os.getenv("SII_RECAPTCHA_PAGE_ACTION", "consultaSTC")
 
-TOKEN_QUEUE_SIZE = int(os.getenv("TOKEN_QUEUE_SIZE", "100"))
+# CapSolver: si está definido, se usan tokens de CapSolver en lugar del navegador (evita timeouts).
+CAPSOLVER_API_KEY = (os.getenv("CAPSOLVER_API_KEY") or "").strip()
+CAPSOLVER_API_URL = (os.getenv("CAPSOLVER_API_URL") or "https://api.capsolver.com").strip().rstrip("/")
+
+TOKEN_QUEUE_SIZE = int(os.getenv("TOKEN_QUEUE_SIZE", "100")) = int(os.getenv("TOKEN_QUEUE_SIZE", "100"))
+
+# Timeout para scripts en el navegador (reCAPTCHA con proxy puede ser lento). Aumentar si ves "script timeout".
+SCRIPT_TIMEOUT_SEC = int(os.getenv("SCRIPT_TIMEOUT_SEC", "120"))
 
 # Undetected Chrome: menos detección por reCAPTCHA (usar si está instalado)
 SII_USE_UC = UC_AVAILABLE and os.getenv("SII_USE_UC", "true").lower() in ("true", "1", "yes")
@@ -125,6 +132,78 @@ def _proxies_for_requests() -> Optional[Dict[str, str]]:
         return None
     url = f"http://{pc['username']}:{pc['password']}@{pc['host']}:{pc['port']}"
     return {"http": url, "https": url}
+
+
+def _capsolver_proxy_string() -> Optional[str]:
+    """Formato proxy para CapSolver: http://user:pass@host:port (Oxylabs)."""
+    pc = _get_proxy_config()
+    if not pc:
+        return None
+    return f"http://{pc['username']}:{pc['password']}@{pc['host']}:{pc['port']}"
+
+
+def _get_token_capsolver() -> Optional[str]:
+    """
+    Obtiene un token reCAPTCHA v3 Enterprise vía CapSolver.
+    Usa proxy Oxylabs si está configurado (ReCaptchaV3EnterpriseTask), si no ProxyLess.
+    """
+    if not CAPSOLVER_API_KEY:
+        return None
+    sitekey = (SII_RECAPTCHA_SITEKEY or SII_RECAPTCHA_SITEKEY_DEFAULT or "").strip() or SII_RECAPTCHA_SITEKEY_DEFAULT
+    task = {
+        "type": "ReCaptchaV3EnterpriseTaskProxyLess",
+        "websiteURL": SII_CONSULTA_URL,
+        "websiteKey": sitekey,
+        "pageAction": SII_RECAPTCHA_PAGE_ACTION,
+    }
+    proxy_str = _capsolver_proxy_string()
+    if proxy_str:
+        task["type"] = "ReCaptchaV3EnterpriseTask"
+        task["proxy"] = proxy_str
+
+    create_url = f"{CAPSOLVER_API_URL}/createTask"
+    result_url = f"{CAPSOLVER_API_URL}/getTaskResult"
+    try:
+        r = requests.post(create_url, json={"clientKey": CAPSOLVER_API_KEY, "task": task}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except requests.RequestException as e:
+        logger.warning("[SII] CapSolver createTask error: %s", e)
+        return None
+    if data.get("errorId", 0) != 0:
+        logger.warning("[SII] CapSolver createTask error: %s", data.get("errorDescription", data))
+        return None
+    task_id = data.get("taskId")
+    if not task_id:
+        logger.warning("[SII] CapSolver no devolvió taskId: %s", data)
+        return None
+
+    for _ in range(30):
+        time.sleep(1)
+        try:
+            r = requests.post(result_url, json={"clientKey": CAPSOLVER_API_KEY, "taskId": task_id}, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+        except requests.RequestException as e:
+            logger.warning("[SII] CapSolver getTaskResult error: %s", e)
+            return None
+        if data.get("errorId", 0) != 0:
+            logger.warning("[SII] CapSolver getTaskResult error: %s", data.get("errorDescription", data))
+            return None
+        status = data.get("status")
+        if status == "ready":
+            solution = data.get("solution") or {}
+            token = solution.get("gRecaptchaResponse")
+            if token and isinstance(token, str) and len(token) > 20:
+                logger.info("[SII] Token obtenido vía CapSolver (proxy=%s)", bool(proxy_str))
+                return token
+            logger.warning("[SII] CapSolver solution sin gRecaptchaResponse: %s", solution)
+            return None
+        if status == "failed":
+            logger.warning("[SII] CapSolver task failed: %s", data)
+            return None
+    logger.warning("[SII] CapSolver getTaskResult timeout")
+    return None
 
 
 def _crear_proxy_auth_extension(proxy_host: str, proxy_port: str, proxy_user: str, proxy_pass: str, out_dir: Path) -> str:
@@ -297,8 +376,8 @@ def _crear_driver_uc():
             kwargs["version_main"] = UC_VERSION_MAIN
             logger.info("[SII] UC usando version_main=%s", UC_VERSION_MAIN)
         dr = uc.Chrome(**kwargs)
-        dr.set_script_timeout(60)
-        dr.set_page_load_timeout(60)
+        dr.set_script_timeout(SCRIPT_TIMEOUT_SEC)
+        dr.set_page_load_timeout(max(60, SCRIPT_TIMEOUT_SEC))
         logger.info("[SII] Navegador UC listo (perfil persistente: %s)", profile_dir)
         return dr, profile_dir
     except Exception as e:
@@ -441,7 +520,6 @@ def _generar_un_token() -> Optional[str]:
 # ----------------------------
 # GENERADOR DE TOKENS (thread)
 # ----------------------------
-SCRIPT_TIMEOUT_SEC = 120
 JS_FALLBACK_MS = 115000  # callback antes del timeout de Selenium (solo Selenium estándar)
 
 
@@ -587,7 +665,12 @@ def _consultar_sii_api(rut: str) -> Dict[str, Any]:
         return {"success": False, "activities": [], "not_found": False, "error": "RUT inválido"}
 
     try:
-        token = token_queue.get(timeout=125)
+        if CAPSOLVER_API_KEY:
+            token = _get_token_capsolver()
+            if not token:
+                return {"success": False, "activities": [], "not_found": False, "error": "CapSolver no devolvió token"}
+        else:
+            token = token_queue.get(timeout=125)
     except queue.Empty:
         logger.error("[SII] Timeout esperando token de la cola")
         return {"success": False, "activities": [], "not_found": False, "error": "No hay tokens reCAPTCHA disponibles (timeout)"}
@@ -634,7 +717,7 @@ def _consultar_sii_api(rut: str) -> Dict[str, Any]:
     tiene_giros = data.get("tieneGirosNegocio", True)
     not_found = not activities and (not registrado or not tiene_giros)
 
-    logger.info("[SII] RUT %s: %d actividades desde API (token pool)", rut, len(activities))
+    logger.info("[SII] RUT %s: %d actividades desde API (%s)", rut, len(activities), "CapSolver" if CAPSOLVER_API_KEY else "token pool")
     return {
         "success": True,
         "activities": activities,
@@ -648,7 +731,7 @@ def _consultar_sii_api(rut: str) -> Dict[str, Any]:
 # ----------------------------
 @app.on_event("startup")
 def startup():
-    """Al iniciar: limpieza, navegador, precalentar 1 token, y thread generador de tokens."""
+    """Al iniciar: si CapSolver está configurado no se usa navegador; si no, se inicia navegador + cola de tokens."""
     try:
         removed = _cleanup_old_sessions()
         if removed > 0:
@@ -656,6 +739,10 @@ def startup():
         VM_TEMP_BASE.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         logger.warning("Limpieza al inicio: %s", e)
+
+    if CAPSOLVER_API_KEY:
+        logger.info("[SII] CapSolver configurado: tokens vía API (sin navegador). Proxy Oxylabs: %s", bool(_get_proxy_config()))
+        return
 
     iniciar_navegador()
     if driver:
@@ -707,6 +794,7 @@ async def health():
         "selenium": SELENIUM_AVAILABLE,
         "undetected_chrome": UC_AVAILABLE,
         "use_uc": SII_USE_UC,
+        "capsolver": bool(CAPSOLVER_API_KEY),
     }
 
 
@@ -735,7 +823,7 @@ async def obtener_giros(body: GirosRequest) -> Dict[str, Any]:
 
     _maybe_run_periodic_cleanup()
 
-    if not driver:
+    if not CAPSOLVER_API_KEY and not driver:
         raise HTTPException(status_code=503, detail="Scraper no disponible (navegador no iniciado)")
 
     logger.info("[SII] POST /giros recibido RUT=%s", rut)
