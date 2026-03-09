@@ -2,7 +2,12 @@
 API de scraping SII para VM.
 Expone POST /api/v1/sii/giros con {"rut": "..."} y devuelve las actividades económicas.
 Arquitectura: 1 navegador Selenium + generador de tokens reCAPTCHA + requests al API del SII.
-Ejecutar en VM para no bloquear IPs (usar Oxylabs u otro proxy si se desea).
+Ejecutar en VM para no bloquear IPs (Oxylabs u otro proxy, mismo patrón que la API de verificación DT).
+
+- Proxy: mismo enfoque que DT (gestion_documental): Oxylabs vía OXY_* o HTTP_PROXY + extensión Chrome.
+- Captcha: SII usa reCAPTCHA v3 Enterprise → CapSolver (ProxyLess). DT usa reCAPTCHA v2 → 2captcha.
+- Uso estimado proxy: SII ~0.02 MB/consulta (solo POST getConsultaData). DT ~0.5-1 MB/verificación (página + captcha + PDF).
+  Variable SII_ESTIMATED_MB_PER_REQUEST para ajustar. Respuesta incluye proxy_usage; GET /api/v1/proxy-stats para totales.
 
 Limpieza de espacio: se usa un directorio temporal para el navegador global que se borra al apagar;
 además se ejecuta limpieza periódica de sesiones viejas (VM_CLEANUP_EVERY_N_REQUESTS) para evitar
@@ -104,6 +109,17 @@ _request_count_lock = threading.Lock()
 driver = None
 session_dir = None
 token_queue = queue.Queue(maxsize=TOKEN_QUEUE_SIZE)
+
+# Tracking de uso de proxy (mismo patrón que DT: estimación MB para Oxylabs)
+# SII: solo el POST getConsultaData va por proxy → ~0.02 MB por consulta (request+response).
+# DT: página + reCAPTCHA v2 + descarga PDF → ~0.5 MB/min ≈ 0.5-1 MB por verificación.
+SII_ESTIMATED_MB_PER_REQUEST = float(os.getenv("SII_ESTIMATED_MB_PER_REQUEST", "0.02"))
+_proxy_usage_lock = threading.Lock()
+_proxy_usage_stats = {
+    "requests_count": 0,
+    "total_estimated_mb": 0.0,
+    "last_reset": datetime.utcnow().isoformat(),
+}
 
 
 def _get_proxy_config() -> Optional[Dict[str, str]]:
@@ -732,12 +748,27 @@ def _consultar_sii_api(rut: str) -> Dict[str, Any]:
     tiene_giros = data.get("tieneGirosNegocio", True)
     not_found = not activities and (not registrado or not tiene_giros)
 
+    # Uso de proxy (mismo patrón que DT): estimación MB por request para Oxylabs
+    proxy_cfg = _get_proxy_config()
+    proxy_usage = None
+    if proxy_cfg:
+        estimated_mb = round(SII_ESTIMATED_MB_PER_REQUEST, 4)
+        proxy_usage = {
+            "proxy_used": True,
+            "proxy_server": f"{proxy_cfg['host']}:{proxy_cfg['port']}",
+            "estimated_mb": estimated_mb,
+        }
+        with _proxy_usage_lock:
+            _proxy_usage_stats["requests_count"] += 1
+            _proxy_usage_stats["total_estimated_mb"] += estimated_mb
+
     logger.info("[SII] RUT %s: %d actividades desde API (%s)", rut, len(activities), "CapSolver" if CAPSOLVER_API_KEY else "token pool")
     return {
         "success": True,
         "activities": activities,
         "not_found": not_found,
         "error": None,
+        "proxy_usage": proxy_usage,
     }
 
 
@@ -801,8 +832,21 @@ def shutdown():
 # ----------------------------
 # ENDPOINTS
 # ----------------------------
+def _get_proxy_usage_stats() -> Dict[str, Any]:
+    """Estadísticas de uso de proxy (mismo patrón que DT)."""
+    with _proxy_usage_lock:
+        return {
+            "requests_count": _proxy_usage_stats["requests_count"],
+            "total_estimated_mb": round(_proxy_usage_stats["total_estimated_mb"], 4),
+            "last_reset": _proxy_usage_stats["last_reset"],
+        }
+
+
 @app.get("/health")
 async def health():
+    proxy_cfg = _get_proxy_config()
+    with _proxy_usage_lock:
+        total_mb = round(_proxy_usage_stats["total_estimated_mb"], 4)
     return {
         "status": "healthy",
         "service": "sii-scraper-vm",
@@ -810,6 +854,9 @@ async def health():
         "undetected_chrome": UC_AVAILABLE,
         "use_uc": SII_USE_UC,
         "capsolver": bool(CAPSOLVER_API_KEY),
+        "proxy_configured": proxy_cfg is not None,
+        "proxy_server": (f"{proxy_cfg['host']}:{proxy_cfg['port']}" if proxy_cfg else None),
+        "proxy_usage_estimated_mb_total": total_mb,
     }
 
 
@@ -824,6 +871,15 @@ async def cleanup_disk():
     except Exception as e:
         logger.exception("Error en cleanup manual: %s", e)
         return {"ok": False, "removed_sessions": 0, "error": str(e)}
+
+
+@app.get("/api/v1/proxy-stats")
+async def proxy_stats():
+    """
+    Uso estimado de proxy (Oxylabs). Mismo concepto que en la API de verificación DT.
+    SII: ~0.02 MB por consulta (solo POST getConsultaData). DT: ~0.5-1 MB por verificación (página + reCAPTCHA v2 + PDF).
+    """
+    return _get_proxy_usage_stats()
 
 
 @app.post("/api/v1/sii/giros")
@@ -850,7 +906,7 @@ async def obtener_giros(body: GirosRequest) -> Dict[str, Any]:
     if result.get("error") and "timeout" in result["error"].lower():
         raise HTTPException(status_code=503, detail=result["error"])
 
-    return {
+    out = {
         "rut": _normalizar_rut(rut),
         "activities": result["activities"],
         "economicActivities": result["activities"],
@@ -858,6 +914,9 @@ async def obtener_giros(body: GirosRequest) -> Dict[str, Any]:
         "error": result.get("error"),
         "success": result["success"],
     }
+    if result.get("proxy_usage") is not None:
+        out["proxy_usage"] = result["proxy_usage"]
+    return out
 
 
 if __name__ == "__main__":

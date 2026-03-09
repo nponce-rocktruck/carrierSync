@@ -300,7 +300,21 @@ Environment="OXY_PORT=60000"
 
 Luego: `sudo systemctl daemon-reload && sudo systemctl restart carrier-sii-scraper`. En logs: `[SII] Proxy residencial configurado (extensión auth): ...`.
 
+### Uso estimado de proxy (MB) – SII vs DT
+
+Mismo patrón que la API de verificación DT (gestion_documental): Oxylabs por extensión Chrome y estimación de MB para control de costes.
+
+| Servicio | reCAPTCHA | Proveedor captcha | Uso aprox. proxy por operación |
+|----------|-----------|-------------------|---------------------------------|
+| **DT** (verificación F30) | v2 | 2captcha | ~0,5–1 MB (página + captcha + descarga PDF) |
+| **SII** (giros por RUT)   | v3 Enterprise | CapSolver (ProxyLess) | ~0,02 MB (solo POST getConsultaData) |
+
+- Cada respuesta de `POST /api/v1/sii/giros` incluye `proxy_usage`: `{ "proxy_used": true, "proxy_server": "unblock.oxylabs.io:60000", "estimated_mb": 0.02 }` cuando hay proxy configurado.
+- Total acumulado: `GET /api/v1/proxy-stats` devuelve `requests_count` y `total_estimated_mb`.
+- Ajuste: variable de entorno `SII_ESTIMATED_MB_PER_REQUEST` (por defecto `0.02`).
+
 ---
+
 
 ## 7.2 CapSolver (reCAPTCHA v3 Enterprise) – recomendado
 
