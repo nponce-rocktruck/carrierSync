@@ -123,23 +123,41 @@ _proxy_usage_stats = {
 }
 
 
+def _normalize_proxy_credential(value: str) -> str:
+    """Elimina CRLF y espacios; evita 401 cuando env.proxy se editó en Windows."""
+    if not value:
+        return ""
+    return str(value).replace("\r", "").replace("\n", "").strip()
+
+
 def _get_proxy_config() -> Optional[Dict[str, str]]:
     """
     Devuelve configuración de proxy para uso con extensión Chrome y para requests.
     Prioridad: OXY_* > HTTP_PROXY + PROXY_USER/PROXY_PASSWORD.
     Si SII_SCRAPER_USE_PROXY=false, no usa proxy.
+    Credenciales se normalizan (sin CRLF) para evitar 401 con proxy HTTP.
     """
     if not SII_SCRAPER_USE_PROXY:
         return None
     if OXY_USER and OXY_PASS and OXY_HOST and OXY_PORT:
-        return {"host": OXY_HOST, "port": OXY_PORT, "username": OXY_USER, "password": OXY_PASS}
+        return {
+            "host": _normalize_proxy_credential(OXY_HOST),
+            "port": _normalize_proxy_credential(OXY_PORT) or "60000",
+            "username": _normalize_proxy_credential(OXY_USER),
+            "password": _normalize_proxy_credential(OXY_PASS),
+        }
     if HTTP_PROXY and PROXY_USER and PROXY_PASSWORD:
         from urllib.parse import urlparse
         parsed = urlparse(HTTP_PROXY if "://" in HTTP_PROXY else "http://" + HTTP_PROXY)
-        host = parsed.hostname or ""
-        port = str(parsed.port or "80")
+        host = (parsed.hostname or "").strip()
+        port = str(parsed.port or "80").strip()
         if host:
-            return {"host": host, "port": port, "username": PROXY_USER, "password": PROXY_PASSWORD}
+            return {
+                "host": host,
+                "port": port,
+                "username": _normalize_proxy_credential(PROXY_USER),
+                "password": _normalize_proxy_credential(PROXY_PASSWORD),
+            }
     return None
 
 
@@ -150,7 +168,9 @@ def _proxies_for_requests() -> Optional[Dict[str, str]]:
         return None
     user = quote(pc["username"], safe="")
     passwd = quote(pc["password"], safe="")
-    url = f"http://{user}:{passwd}@{pc['host']}:{pc['port']}"
+    host = pc["host"].strip()
+    port = str(pc["port"]).strip()
+    url = f"http://{user}:{passwd}@{host}:{port}"
     return {"http": url, "https": url}
 
 

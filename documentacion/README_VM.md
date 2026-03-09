@@ -244,6 +244,12 @@ Comprobar: `curl -s http://localhost:8082/health`.
 - **En /health sale "selenium": false:** Chromium no está bien instalado o no se instalaron las dependencias del venv; repite el paso de Chromium y `./venv/bin/pip install -r requirements_vm.txt`.
 - **Disco lleno en la VM:** El scraper limpia temporales; además puedes llamar a `POST http://34.176.102.209:8082/api/v1/cleanup` para forzar limpieza.
 - **El SII bloquea o no devuelve datos:** Configura proxy residencial (Oxylabs) como en gestion_documental; ver sección "Configurar proxy residencial" más abajo. Si el SII responde con **"usuario no autorizado por ReCaptcha"**, ver sección 7.2.
+- **Proxy 401 Unauthorized** (mismo usuario/contraseña que en DT pero falla en SII): Suele ser **CRLF** en `env.proxy` si lo editaste en Windows. En la VM ejecuta:
+  ```bash
+  sed -i 's/\r$//' ~/carrierSync/env.proxy
+  sudo systemctl restart carrier-sii-scraper
+  ```
+  O reescribe las variables en la VM con `nano ~/carrierSync/env.proxy` (guardar con Ctrl+O, Enter, Ctrl+X). Luego `git pull` para tener el código que normaliza credenciales y reinicia el servicio.
 
 ---
 
