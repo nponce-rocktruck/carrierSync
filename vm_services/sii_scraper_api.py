@@ -64,14 +64,15 @@ app = FastAPI(title="CarrierSync VM - SII Scraper", version="1.0.0")
 # ----------------------------
 # CONFIG (tus variables)
 # ----------------------------
-OXY_USER = os.getenv("OXY_USER", "")
-OXY_PASS = os.getenv("OXY_PASS", "")
-OXY_HOST = os.getenv("OXY_HOST", "unblock.oxylabs.io")
-OXY_PORT = os.getenv("OXY_PORT", "60000")
+# Strip para evitar 401 por espacios/CRLF si env.proxy se editó en Windows
+OXY_USER = (os.getenv("OXY_USER") or "").strip()
+OXY_PASS = (os.getenv("OXY_PASS") or "").strip()
+OXY_HOST = (os.getenv("OXY_HOST") or "unblock.oxylabs.io").strip() or "unblock.oxylabs.io"
+OXY_PORT = (os.getenv("OXY_PORT") or "60000").strip() or "60000"
 
-HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
-PROXY_USER = os.getenv("PROXY_USER", "")
-PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "")
+HTTP_PROXY = (os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or "").strip() or None
+PROXY_USER = (os.getenv("PROXY_USER") or "").strip()
+PROXY_PASSWORD = (os.getenv("PROXY_PASSWORD") or "").strip()
 
 SII_SCRAPER_USE_PROXY = os.getenv("SII_SCRAPER_USE_PROXY", "true").lower() not in ("false", "0", "no")
 
@@ -787,7 +788,17 @@ def startup():
         logger.warning("Limpieza al inicio: %s", e)
 
     if CAPSOLVER_API_KEY:
-        logger.info("[SII] CapSolver configurado: tokens vía API (sin navegador). Proxy Oxylabs: %s", bool(_get_proxy_config()))
+        pc = _get_proxy_config()
+        if pc:
+            # Log usuario (ocultar pass) para verificar que env.proxy se leyó bien; 401 = credenciales rechazadas por Oxylabs
+            u = (pc.get("username") or "").strip()
+            user_log = (u[:8] + "***") if len(u) > 8 else ("***" if u else "?")
+            logger.info(
+                "[SII] CapSolver configurado: tokens vía API (sin navegador). Proxy: %s:%s user=%s",
+                pc.get("host"), pc.get("port"), user_log,
+            )
+        else:
+            logger.info("[SII] CapSolver configurado: tokens vía API (sin navegador). Proxy Oxylabs: False")
         return
 
     iniciar_navegador()

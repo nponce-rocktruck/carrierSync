@@ -88,6 +88,9 @@ sudo systemctl restart carrier-sii-scraper
 curl -s http://localhost:8082/health
 
 
+nano /home/pc/carrierSync/env.proxy
+control 0 enter control x
+
 sudo journalctl -u carrier-sii-scraper -n 80 --no-pager
 
 
