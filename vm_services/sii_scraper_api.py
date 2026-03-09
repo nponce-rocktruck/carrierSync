@@ -70,7 +70,7 @@ OXY_PASS = (os.getenv("OXY_PASS") or "").strip()
 OXY_HOST = (os.getenv("OXY_HOST") or "unblock.oxylabs.io").strip() or "unblock.oxylabs.io"
 OXY_PORT = (os.getenv("OXY_PORT") or "60000").strip() or "60000"
 
-OXY_USER = "conirarra_FyqF8"
+OXY_USER = "conirarra_SoC5w"
 OXY_PASS = "Clemente_2011"
 OXY_HOST = "unblock.oxylabs.io"
 OXY_PORT = "60000"
@@ -741,6 +741,7 @@ def _consultar_sii_api(rut: str) -> Dict[str, Any]:
         "dv": dv,
         "reAction": SII_RECAPTCHA_PAGE_ACTION,
         "reToken": token,
+        "verify": False,
     }
 
     proxies = _proxies_for_requests()
