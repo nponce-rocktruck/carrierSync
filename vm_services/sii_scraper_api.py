@@ -415,9 +415,13 @@ def _crear_driver_uc():
     proxy_cfg = _get_proxy_config()
     if proxy_cfg:
         try:
+            #ext_path = _crear_proxy_auth_extension(
+             #   proxy_cfg["host"], proxy_cfg["port"],
+              #  proxy_cfg["username"], proxy_cfg["password"],
+            #)
             ext_path = _crear_proxy_auth_extension(
-                proxy_cfg["host"], proxy_cfg["port"],
-                proxy_cfg["username"], proxy_cfg["password"],
+                OXY_HOST, OXY_PORT,
+                OXY_USER, OXY_PASS,
                 profile_dir,
             )
             options.add_argument(f"--load-extension={ext_path}")
