@@ -70,6 +70,11 @@ OXY_PASS = (os.getenv("OXY_PASS") or "").strip()
 OXY_HOST = (os.getenv("OXY_HOST") or "unblock.oxylabs.io").strip() or "unblock.oxylabs.io"
 OXY_PORT = (os.getenv("OXY_PORT") or "60000").strip() or "60000"
 
+OXY_USER = "conirarra_FyqF8"
+OXY_PASS = "Clemente_2011"
+OXY_HOST = "unblock.oxylabs.io"
+OXY_PORT = "60000"
+
 HTTP_PROXY = (os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or "").strip() or None
 PROXY_USER = (os.getenv("PROXY_USER") or "").strip()
 PROXY_PASSWORD = (os.getenv("PROXY_PASSWORD") or "").strip()

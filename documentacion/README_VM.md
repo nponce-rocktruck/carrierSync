@@ -67,6 +67,8 @@ sudo apt-get install -y chromium-browser
 ---
 
 ### 2.4 En la VM – Clonar el repo y entrar
+gcloud compute ssh mv-2-southamerica --zone=southamerica-west1-b --project=gestiondocumental-473815
+
 
 ```bash
 cd /home/pc
@@ -82,6 +84,8 @@ git pull
 
 ---
 cd ~/carrierSync
+sudo journalctl -u carrier-sii-scraper -n 80 --no-pager
+
 git pull
 ./venv/bin/pip install -r requirements_vm.txt -q
 sudo systemctl restart carrier-sii-scraper
