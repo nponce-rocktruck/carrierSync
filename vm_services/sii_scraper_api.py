@@ -745,12 +745,14 @@ def _consultar_sii_api(rut: str) -> Dict[str, Any]:
     }
 
     proxies = _proxies_for_requests()
+    OXY_CERT = "/home/pc/carrierSync/oxylabs.crt"
     try:
         r = requests.post(
             SII_GET_CONSULTA_DATA_URL,
             json=payload,
             timeout=20,
             proxies=proxies,
+            verify= OXY_CERT,
         )
         r.raise_for_status()
         data = r.json()
