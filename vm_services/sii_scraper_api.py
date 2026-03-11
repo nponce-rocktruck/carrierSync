@@ -727,7 +727,6 @@ def _consultar_sii_api(rut: str) -> Dict[str, Any]:
         "dv": dv,
         "reAction": SII_RECAPTCHA_PAGE_ACTION,
         "reToken": token,
-        "verify": False,
     }
 
     proxies = _proxies_for_requests()
