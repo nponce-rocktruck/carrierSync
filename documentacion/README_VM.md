@@ -287,7 +287,7 @@ git pull
 ./venv/bin/pip install -r requirements_vm.txt -q
 sudo systemctl restart carrier-sii-scraper
 ```
-
+nano /home/pc/carrierSync/env.proxy
 Comprobar: `curl -s http://localhost:8082/health`.
 
 ---

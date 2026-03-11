@@ -797,11 +797,23 @@ def _consultar_sii_api(rut: str) -> Dict[str, Any]:
             data.get("tieneGirosNegocio"),
         )
     except requests.RequestException as e:
+        status = None
+        body = None
+        try:
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                status = resp.status_code
+                # Limitar tamaño para logs
+                body = (resp.text or "")[:1000]
+        except Exception:
+            body = None
         logger.warning(
-            "[SII] Error request getConsultaData: %s (proxies=%s verify=%s)",
+            "[SII] Error request getConsultaData: %s (status=%s proxies=%s verify=%s body=%s)",
             e,
+            status,
             bool(proxies),
             verify,
+            body,
         )
         return {"success": False, "activities": [], "not_found": False, "error": str(e)}
 
