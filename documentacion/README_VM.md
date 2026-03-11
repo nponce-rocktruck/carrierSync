@@ -84,7 +84,6 @@ git pull
 
 ---
 cd ~/carrierSync
-sudo journalctl -u carrier-sii-scraper -n 80 --no-pager
 
 git pull
 ./venv/bin/pip install -r requirements_vm.txt -q
@@ -149,6 +148,59 @@ VM_SII_SCRAPER_URL: "http://34.176.102.209:8082"
 ```
 
 Guarda los dos archivos.
+
+---
+
+### 2.8 Variables de entorno en la VM (proxy + CapSolver)
+
+El scraper SII **siempre usa proxy residencial** cuando está configurado. Las variables se cargan desde un archivo en la VM; no van en el repo.
+
+**Dónde ponerlas:** en la VM, archivo `/home/pc/carrierSync/env.proxy` (el servicio systemd ya tiene `EnvironmentFile=/home/pc/carrierSync/env.proxy`).
+
+**Variables obligatorias (proxy residencial, ej. DataImpulse u otro):**
+
+| Variable | Descripción | Ejemplo |
+|----------|-------------|---------|
+| `PROXY_HOST` | Host del proxy | `gw.dataimpulse.com` |
+| `PROXY_PORT` | Puerto | `823` |
+| `PROXY_USER` | Usuario (o `PROXY_USERNAME`) | `tu_usuario` |
+| `PROXY_PASSWORD` | Contraseña (o `PROXY_PASS`) | `tu_password` |
+
+**Para usar CapSolver (recomendado; evita Chrome y timeouts):**
+
+| Variable | Descripción |
+|----------|-------------|
+| `CAPSOLVER_API_KEY` | API key de [CapSolver](https://dashboard.capsolver.com/) |
+
+**Opcionales:** `PROXY_VERIFY_SSL=true` (por defecto), `PROXY_CA_BUNDLE=/ruta/certificado.crt` si el proxy exige un CA custom, `SCRIPT_TIMEOUT_SEC=120`, `SII_RECAPTCHA_SITEKEY`, `SII_RECAPTCHA_PAGE_ACTION=consultaSTC`.
+
+**Cómo ponerlas en la VM:**
+
+1. Conéctate por SSH (ver 2.2).
+2. Edita el archivo (si no existe, créalo):
+   ```bash
+   nano /home/pc/carrierSync/env.proxy
+   ```
+3. Escribe una variable por línea, sin espacios alrededor del `=`:
+   ```ini
+   PROXY_HOST=gw.dataimpulse.com
+   PROXY_PORT=823
+   PROXY_USER=tu_usuario
+   PROXY_PASSWORD=tu_contraseña
+   CAPSOLVER_API_KEY=CAP-tu_api_key
+   ```
+4. Guardar: **Ctrl+O**, Enter, **Ctrl+X**.
+5. Reiniciar el servicio para que cargue las variables:
+   ```bash
+   sudo systemctl restart carrier-sii-scraper
+   ```
+6. Comprobar: `curl -s http://localhost:8082/health` (debe mostrar `"proxy_configured": true` si el proxy está bien configurado).
+
+**Si editaste env.proxy en Windows:** puede quedar con saltos de línea CRLF y dar 401. En la VM ejecuta:
+   ```bash
+   sed -i 's/\r$//' /home/pc/carrierSync/env.proxy
+   sudo systemctl restart carrier-sii-scraper
+   ```
 
 ---
 
@@ -247,13 +299,8 @@ Comprobar: `curl -s http://localhost:8082/health`.
 - **Desde la PC “connection refused” al 8082:** Comprueba el firewall (paso 2.1) y en la VM: `sudo systemctl status carrier-sii-scraper` (debe decir “active (running)”).
 - **En /health sale "selenium": false:** Chromium no está bien instalado o no se instalaron las dependencias del venv; repite el paso de Chromium y `./venv/bin/pip install -r requirements_vm.txt`.
 - **Disco lleno en la VM:** El scraper limpia temporales; además puedes llamar a `POST http://34.176.102.209:8082/api/v1/cleanup` para forzar limpieza.
-- **El SII bloquea o no devuelve datos:** Configura proxy residencial (Oxylabs) como en gestion_documental; ver sección "Configurar proxy residencial" más abajo. Si el SII responde con **"usuario no autorizado por ReCaptcha"**, ver sección 7.2.
-- **Proxy 401 Unauthorized** (mismo usuario/contraseña que en DT pero falla en SII): Suele ser **CRLF** en `env.proxy` si lo editaste en Windows. En la VM ejecuta:
-  ```bash
-  sed -i 's/\r$//' ~/carrierSync/env.proxy
-  sudo systemctl restart carrier-sii-scraper
-  ```
-  O reescribe las variables en la VM con `nano ~/carrierSync/env.proxy` (guardar con Ctrl+O, Enter, Ctrl+X). Luego `git pull` para tener el código que normaliza credenciales y reinicia el servicio.
+- **El SII bloquea o no devuelve datos:** Configura proxy residencial (variables PROXY_* en `env.proxy`); ver sección **2.8** y **7.1**. Si el SII responde con **"usuario no autorizado por ReCaptcha"**, ver sección 7.2.
+- **Proxy 401 Unauthorized:** Suele ser **CRLF** en `env.proxy` si lo editaste en Windows. En la VM: `sed -i 's/\r$//' ~/carrierSync/env.proxy` y `sudo systemctl restart carrier-sii-scraper`. O reescribe las variables con `nano ~/carrierSync/env.proxy` (Ctrl+O, Enter, Ctrl+X).
 
 ---
 
@@ -267,62 +314,53 @@ Si en los logs o en la respuesta del API aparece que el SII rechazó la consulta
 
 **Opciones posibles (avanzado):**
 
-1. **Sin proxy (solo pruebas):** `SII_SCRAPER_USE_PROXY=false` puede reducir rechazos de reCAPTCHA en algunos entornos, pero **en producción no conviene**: el SII suele bloquear la IP tras pocas solicitudes. Mantener el proxy es necesario para uso continuado.
-2. **2Captcha (integrado):** El scraper ya usa la misma API de 2Captcha que gestion_documental. Configura `API_KEY_2CAPTCHA` y, si hace falta, `SII_RECAPTCHA_SITEKEY`. Ver sección **7.3 Configurar 2Captcha**.
-3. **Consultas manuales / API oficial:** Si el SII ofrece una API o proceso manual para obtener actividades económicas, usarla como alternativa.
+1. **CapSolver (recomendado):** Con proxy residencial configurado (PROXY_*), el scraper usa CapSolver con el mismo proxy para que el token y la petición al SII salgan por la misma IP. Configura `CAPSOLVER_API_KEY` en `env.proxy`; ver sección **7.2**.
+2. **Consultas manuales / API oficial:** Si el SII ofrece una API o proceso manual para obtener actividades económicas, usarla como alternativa.
 
 Para confirmar que es reCAPTCHA, en la VM puedes revisar el HTML guardado:
 `grep -i recaptcha /tmp/carriersync_scraper/debug/sii_no_open_btn.html`
 
+**Configuración actual del scraper SII:** Se usa **proxy residencial genérico** (variables PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASSWORD), compatible con cualquier proveedor (DataImpulse, etc.). Con **CapSolver** el token de reCAPTCHA v3 Enterprise se obtiene usando el mismo proxy, de modo que la IP al resolver el captcha y al llamar al API del SII coinciden (evita `captchaInvalido`). El flujo es: GET a la página del SII por proxy (para cookies) y POST a getConsultaData con la misma sesión. No hay opción para desactivar el proxy: si las variables están definidas, se usa; si no, las consultas van sin proxy (el SII puede bloquear la IP).
+
 ---
 
-## 7.1 Configurar proxy residencial (Oxylabs)
+## 7.1 Configurar proxy residencial (genérico)
 
-Si el SII bloquea la IP de la VM, usa el mismo proxy residencial que en gestion_documental.
+El scraper usa **variables genéricas** (cualquier proveedor: DataImpulse, Oxylabs, etc.). Sin proxy configurado, el SII suele bloquear la IP de la VM.
 
-**Opción A – Archivo de credenciales (recomendado, no sube secretos al repo)**
+**Dónde configurar:** archivo `/home/pc/carrierSync/env.proxy` en la VM (el servicio ya carga ese archivo con `EnvironmentFile=`).
 
-El servicio **carrier-sii-scraper-shared-vm.service** ya usa `EnvironmentFile=/home/pc/carrierSync/env.proxy`. Si en los logs ves `Proxy residencial configurado (UC): unblock.oxylabs.io:60000` en lugar de tu proxy (ej. `pr.oxylabs.io:7777`), en la VM está instalada la **versión antigua** del servicio (con `Environment=` sueltos). Actualiza así:
-
-1. En la VM, copia el .service del repo sobre el de systemd:
-   ```bash
-   cd ~/carrierSync && git pull
-   sudo cp scripts_vm/carrier-sii-scraper-shared-vm.service /etc/systemd/system/carrier-sii-scraper.service
-   sudo systemctl daemon-reload
-   ```
-2. Crea o edita `env.proxy` con tus valores (proxy, 2Captcha, opcionalmente `SCRIPT_TIMEOUT_SEC=180` si hay "script timeout"):
-   ```bash
-   cp env.proxy.example env.proxy
-   nano env.proxy
-   ```
-   Usa las **mismas credenciales Oxylabs que gestion_documental**: `OXY_USER=conirarra_FyqF8`, `OXY_PASS=...`, `OXY_HOST=unblock.oxylabs.io`, `OXY_PORT=60000`.
-3. Reinicia: `sudo systemctl restart carrier-sii-scraper`.
-
-A partir de ahí, para cambiar credenciales solo editas `env.proxy` y reinicias; no hace falta tocar el .service.
-
-**Opción B – Variables en systemd**
-
-Usa las **mismas credenciales Oxylabs que gestion_documental** (ver `gestion_documental/documentacion/README_VM.md`). En `systemctl edit --full carrier-sii-scraper`, bajo `[Service]` añade:
+**Variables necesarias:**
 
 ```ini
-Environment="OXY_USER=conirarra_FyqF8"
-Environment="OXY_PASS=Clemente_2011"
-Environment="OXY_HOST=unblock.oxylabs.io"
-Environment="OXY_PORT=60000"
+PROXY_HOST=gw.dataimpulse.com
+PROXY_PORT=823
+PROXY_USER=tu_usuario
+PROXY_PASSWORD=tu_contraseña
 ```
 
-Luego: `sudo systemctl daemon-reload && sudo systemctl restart carrier-sii-scraper`. En logs: `[SII] Proxy residencial configurado (extensión auth): ...`.
+(Sustituye por el host/puerto/usuario/contraseña de tu proveedor de proxy residencial, por ejemplo Chile para el SII.)
+
+**Pasos:**
+
+1. En la VM: `nano /home/pc/carrierSync/env.proxy`
+2. Añade o edita las cuatro variables (una por línea, sin espacios alrededor del `=`).
+3. Guarda (Ctrl+O, Enter, Ctrl+X).
+4. Reinicia el servicio: `sudo systemctl restart carrier-sii-scraper`.
+5. Comprueba en logs: `sudo journalctl -u carrier-sii-scraper -n 20 --no-pager` — debe aparecer algo como `[SII] Proxy residencial configurado (UC): host:puerto`.
+
+Para cambiar credenciales en el futuro, solo editas `env.proxy` y reinicias; no hace falta tocar el .service.
 
 ### Uso estimado de proxy (MB) – SII vs DT
 
-Mismo patrón que la API de verificación DT (gestion_documental): Oxylabs por extensión Chrome y estimación de MB para control de costes.
+Mismo patrón que la API de verificación DT: proxy residencial y estimación de MB para control de costes.
 
 | Servicio | reCAPTCHA | Proveedor captcha | Uso aprox. proxy por operación |
 |----------|-----------|-------------------|---------------------------------|
 | **DT** (verificación F30) | v2 | 2captcha | ~0,5–1 MB (página + captcha + descarga PDF) |
-| **SII** (giros por RUT)   | v3 Enterprise | CapSolver (ProxyLess) | ~0,02 MB (solo POST getConsultaData) |
+| **SII** (giros por RUT)   | v3 Enterprise | CapSolver (con mismo proxy) | ~0,02 MB (GET sesión + POST getConsultaData) |
 
-- Cada respuesta de `POST /api/v1/sii/giros` incluye `proxy_usage`: `{ "proxy_used": true, "proxy_server": "unblock.oxylabs.io:60000", "estimated_mb": 0.02 }` cuando hay proxy configurado.
+- Cada respuesta de `POST /api/v1/sii/giros` incluye `proxy_usage` con `proxy_server` y `estimated_mb` cuando hay proxy configurado.
 - Total acumulado: `GET /api/v1/proxy-stats` devuelve `requests_count` y `total_estimated_mb`.
 - Ajuste: variable de entorno `SII_ESTIMATED_MB_PER_REQUEST` (por defecto `0.02`).
 
@@ -331,17 +369,16 @@ Mismo patrón que la API de verificación DT (gestion_documental): Oxylabs por e
 
 ## 7.2 CapSolver (reCAPTCHA v3 Enterprise) – recomendado
 
-Si configuras **CapSolver**, el scraper obtiene los tokens de reCAPTCHA vía API y **no inicia Chrome** (evita timeouts y uso de memoria).
+Con **CapSolver** el scraper obtiene los tokens de reCAPTCHA vía API y **no inicia Chrome** (evita timeouts y uso de memoria). El token se resuelve usando **el mismo proxy** (PROXY_*) que la petición al SII, para que la IP coincida y el SII no devuelva `captchaInvalido`.
 
 1. Crea cuenta y obtén tu API key en [CapSolver](https://dashboard.capsolver.com/).
-2. En `env.proxy` añade (con tu clave real):
+2. En `/home/pc/carrierSync/env.proxy` añade (junto a PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASSWORD):
    ```ini
    CAPSOLVER_API_KEY=CAP-tu_api_key_aqui
    ```
-3. El proxy Oxylabs que ya tienes en `env.proxy` se usa también para CapSolver (misma IP al resolver y al llamar al SII).
-4. Reinicia: `sudo systemctl restart carrier-sii-scraper`. En logs debe aparecer `[SII] CapSolver configurado: tokens vía API (sin navegador)`.
+3. Reinicia: `sudo systemctl restart carrier-sii-scraper`. En logs: `[SII] CapSolver configurado: tokens vía API (sin navegador)`.
 
-En cada consulta se pide un token a CapSolver (tipo `ReCaptchaV3EnterpriseTask` con proxy Oxylabs) y se llama al API del SII con ese token. No hace falta 2Captcha ni el navegador.
+En cada consulta se pide un token a CapSolver (ReCaptchaV3EnterpriseTask con tu proxy) y se hace GET a la página SII + POST a getConsultaData con la misma sesión/proxy. No hace falta 2Captcha ni el navegador.
 
 ---
 
@@ -359,53 +396,15 @@ En cada consulta se pide un token a CapSolver (tipo `ReCaptchaV3EnterpriseTask` 
 
 ---
 
-## 7.4 Si falla en todas las consultas (captchaInvalido con proxy)
+## 7.4 Si falla en todas las consultas (captchaInvalido)
 
-Cuando **todas** las consultas devuelven rechazo por reCAPTCHA o `captchaInvalido=true` en la API del SII, el backend valida el token con Google y lo rechaza.
+Cuando **todas** las consultas devuelven `captchaInvalido=true`, el SII/Google están rechazando el token. Con la configuración actual (proxy + CapSolver con el mismo proxy), el token y la petición salen por la misma IP; si sigue fallando:
 
-**Resultado de la prueba sin proxy:** Si probaste con `SII_SCRAPER_USE_PROXY=false` y en logs aparece `[SII] API getConsultaData devolvió captchaInvalido=true`, significa que **incluso sin proxy** Google/SII rechazan el token: 2Captcha lo genera en sus workers (otra IP y otro navegador), y reCAPTCHA v3 Enterprise valida que el token se use en el mismo contexto. **2Captcha no admite proxy para reCAPTCHA v3** (según su documentación, el uso de proxy reduce mucho la tasa de acierto), así que no se puede hacer que el worker resuelva desde la misma IP que nuestro Chrome. Con proxy o sin él, el token sigue siendo rechazado.
+- **Comprobar variables:** que `env.proxy` tenga bien PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASSWORD y CAPSOLVER_API_KEY (sin espacios ni CRLF; en la VM `sed -i 's/\r$//' /home/pc/carrierSync/env.proxy` si editaste en Windows).
+- **Proveedor de proxy:** debe ser residencial y, si es posible, IP de Chile para el SII.
+- **CapSolver:** revisar en el dashboard que las tareas no fallen y que el tipo sea ReCaptchaV3EnterpriseTask con proxy.
 
-Opciones viables:
-
-**1. Probar sin proxy (solo para descartar)**  
-Sirve para confirmar que el rechazo es por el token y no por la IP. Pasos:
-
-1. **En la VM**, editar el servicio y activar la variable:
-   ```bash
-   sudo systemctl edit --full carrier-sii-scraper
-   ```
-   En la sección `[Service]`, añade una línea (junto a las demás `Environment=`):
-   ```ini
-   Environment="SII_SCRAPER_USE_PROXY=false"
-   ```
-   Guarda y cierra (en nano: Ctrl+O, Enter, Ctrl+X).
-
-2. **Recargar y reiniciar:**
-   ```bash
-   sudo systemctl daemon-reload && sudo systemctl restart carrier-sii-scraper
-   ```
-
-3. **Comprobar que arrancó:** en logs debe aparecer `[SII] Proxy desactivado (SII_SCRAPER_USE_PROXY=false)`.
-   ```bash
-   sudo journalctl -u carrier-sii-scraper -n 30 --no-pager
-   ```
-
-4. **Lanzar 1–2 consultas** al scraper (reemplaza `RUT_CON_PUNTOS_Y_DV` por un RUT válido, ej. `17.807.161-0`):
-   ```bash
-   curl -X POST "http://localhost:8082/api/v1/sii/giros" -H "Content-Type: application/json" -d "{\"rut\": \"RUT_CON_PUNTOS_Y_DV\"}"
-   ```
-   Si aparece `[SII] API getConsultaData devolvió captchaInvalido=true`, el token de 2Captcha no es aceptado ni siquiera sin proxy (caso habitual).
-
-5. **Volver a activar el proxy** cuando termines de probar: quita la línea `Environment="SII_SCRAPER_USE_PROXY=false"`, luego `sudo systemctl daemon-reload && sudo systemctl restart carrier-sii-scraper`.
-
-**2. Otro servicio anti-captcha**  
-Probar un proveedor que permita reCAPTCHA v3 Enterprise **con proxy** (misma IP que el navegador), por ejemplo Capsolver o Anti-Captcha, e integrar su API en lugar de 2Captcha.
-
-**3. Solicitar API o canal oficial al SII**  
-Preguntar al SII si tienen API oficial o convenio para consultar situación tributaria/giros sin reCAPTCHA. Es la opción más estable a largo plazo.
-
-**4. Proceso manual o semiautomático**  
-Mientras no haya API ni captcha que funcione: que un usuario resuelva el captcha en el navegador para casos críticos; el resto en cola o "pendiente de verificación".
+Otras opciones: solicitar API o canal oficial al SII; o proceso manual/semiautomático para casos críticos.
 
 ---
 
@@ -436,6 +435,7 @@ Group=pc
 WorkingDirectory=/home/pc/carrierSync
 Environment="PATH=/home/pc/carrierSync/venv/bin:/usr/local/bin:/usr/bin:/bin"
 Environment=PORT=8082
+EnvironmentFile=/home/pc/carrierSync/env.proxy
 ExecStart=/home/pc/carrierSync/venv/bin/uvicorn vm_services.sii_scraper_api:app --host 0.0.0.0 --port 8082
 Restart=always
 RestartSec=10
@@ -446,6 +446,8 @@ SyslogIdentifier=carrier-sii-scraper
 [Install]
 WantedBy=multi-user.target
 ```
+
+Crea también `env.proxy` con PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASSWORD y opcionalmente CAPSOLVER_API_KEY (ver 2.8).
 
 Guardar: **Ctrl+O**, Enter, **Ctrl+X**.
 

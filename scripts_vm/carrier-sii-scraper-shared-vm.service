@@ -15,13 +15,9 @@ Group=pc
 WorkingDirectory=/home/pc/carrierSync
 Environment="PATH=/home/pc/carrierSync/venv/bin:/usr/local/bin:/usr/bin:/bin"
 Environment=PORT=8082
-# Proxy y 2Captcha: se cargan desde env.proxy (editar ese archivo para cambiar credenciales)
+# Proxy y CapSolver: se cargan desde env.proxy (editar ese archivo para cambiar credenciales)
 EnvironmentFile=/home/pc/carrierSync/env.proxy
 
-# Las variables OXY_* y API_KEY_2CAPTCHA ya vienen de env.proxy
-# Para cambiar usuario/contraseña/host/puerto: edita env.proxy y reinicia el servicio
-# Para probar sin proxy (validar que el token es aceptado): descomentar la siguiente línea
-# Environment="SII_SCRAPER_USE_PROXY=false"
 ExecStart=/home/pc/carrierSync/venv/bin/uvicorn vm_services.sii_scraper_api:app --host 0.0.0.0 --port 8082
 Restart=always
 RestartSec=10

@@ -4,8 +4,9 @@ Expone POST /api/v1/sii/giros con {"rut": "..."} y devuelve las actividades econ
 Arquitectura: 1 navegador Selenium + generador de tokens reCAPTCHA + requests al API del SII.
 Ejecutar en VM para no bloquear IPs (Oxylabs u otro proxy, mismo patrón que la API de verificación DT).
 
-- Proxy: mismo enfoque que DT (gestion_documental): Oxylabs vía OXY_* o HTTP_PROXY + extensión Chrome.
-- Captcha: SII usa reCAPTCHA v3 Enterprise → CapSolver (ProxyLess). DT usa reCAPTCHA v2 → 2captcha.
+- Proxy: genérico (cualquier residencial). Variables PROXY_HOST/PROXY_PORT/PROXY_USER/PROXY_PASSWORD.
+  Con proxy + CapSolver se usa el mismo proxy en CapSolver para que el token coincida con la IP.
+- Captcha: SII usa reCAPTCHA v3 Enterprise → CapSolver (con proxy si está configurado; si no, ProxyLess).
 - Uso estimado proxy: SII ~0.02 MB/consulta (solo POST getConsultaData). DT ~0.5-1 MB/verificación (página + captcha + PDF).
   Variable SII_ESTIMATED_MB_PER_REQUEST para ajustar. Respuesta incluye proxy_usage; GET /api/v1/proxy-stats para totales.
 
@@ -25,7 +26,7 @@ import zipfile
 import json
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from uuid import uuid4
 from urllib.parse import quote
 
@@ -62,24 +63,16 @@ except ImportError:
 app = FastAPI(title="CarrierSync VM - SII Scraper", version="1.0.0")
 
 # ----------------------------
-# CONFIG (tus variables)
+# CONFIG (variables genéricas de proxy; compatible con cualquier proveedor)
 # ----------------------------
-# Strip para evitar 401 por espacios/CRLF si env.proxy se editó en Windows
-OXY_USER = (os.getenv("OXY_USER") or "").strip()
-OXY_PASS = (os.getenv("OXY_PASS") or "").strip()
-OXY_HOST = (os.getenv("OXY_HOST") or "unblock.oxylabs.io").strip() or "unblock.oxylabs.io"
-OXY_PORT = (os.getenv("OXY_PORT") or "60000").strip() or "60000"
+# Strip para evitar 401 por espacios/CRLF si env se editó en Windows
+PROXY_HOST = (os.getenv("PROXY_HOST") or "").strip()
+PROXY_PORT = (os.getenv("PROXY_PORT") or "").strip()
+PROXY_USER = (os.getenv("PROXY_USER") or os.getenv("PROXY_USERNAME") or "").strip()
+PROXY_PASSWORD = (os.getenv("PROXY_PASSWORD") or os.getenv("PROXY_PASS") or "").strip()
 
-OXY_USER = "conirarra_SoC5w"
-OXY_PASS = "Clemente_2011"
-OXY_HOST = "unblock.oxylabs.io"
-OXY_PORT = "60000"
-
-HTTP_PROXY = (os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or "").strip() or None
-PROXY_USER = (os.getenv("PROXY_USER") or "").strip()
-PROXY_PASSWORD = (os.getenv("PROXY_PASSWORD") or "").strip()
-
-SII_SCRAPER_USE_PROXY = os.getenv("SII_SCRAPER_USE_PROXY", "true").lower() not in ("false", "0", "no")
+PROXY_VERIFY_SSL = os.getenv("PROXY_VERIFY_SSL", "true").lower() in ("true", "1", "yes")
+PROXY_CA_BUNDLE = (os.getenv("PROXY_CA_BUNDLE") or "").strip() or None
 
 SII_RECAPTCHA_SITEKEY = os.getenv("SII_RECAPTCHA_SITEKEY", "").strip()
 SII_RECAPTCHA_SITEKEY_DEFAULT = "6Lc_DPAqAAAAAB7QWxHsaPDNxLLOUj9VkiuAXRYP"
@@ -138,32 +131,17 @@ def _normalize_proxy_credential(value: str) -> str:
 def _get_proxy_config() -> Optional[Dict[str, str]]:
     """
     Devuelve configuración de proxy para uso con extensión Chrome y para requests.
-    Prioridad: OXY_* > HTTP_PROXY + PROXY_USER/PROXY_PASSWORD.
-    Si SII_SCRAPER_USE_PROXY=false, no usa proxy.
+    Requiere PROXY_HOST, PROXY_USER y PROXY_PASSWORD.
     Credenciales se normalizan (sin CRLF) para evitar 401 con proxy HTTP.
     """
-    if not SII_SCRAPER_USE_PROXY:
+    if not (PROXY_HOST and PROXY_USER and PROXY_PASSWORD):
         return None
-    if OXY_USER and OXY_PASS and OXY_HOST and OXY_PORT:
-        return {
-            "host": _normalize_proxy_credential(OXY_HOST),
-            "port": _normalize_proxy_credential(OXY_PORT) or "60000",
-            "username": _normalize_proxy_credential(OXY_USER),
-            "password": _normalize_proxy_credential(OXY_PASS),
-        }
-    if HTTP_PROXY and PROXY_USER and PROXY_PASSWORD:
-        from urllib.parse import urlparse
-        parsed = urlparse(HTTP_PROXY if "://" in HTTP_PROXY else "http://" + HTTP_PROXY)
-        host = (parsed.hostname or "").strip()
-        port = str(parsed.port or "80").strip()
-        if host:
-            return {
-                "host": host,
-                "port": port,
-                "username": _normalize_proxy_credential(PROXY_USER),
-                "password": _normalize_proxy_credential(PROXY_PASSWORD),
-            }
-    return None
+    return {
+        "host": _normalize_proxy_credential(PROXY_HOST),
+        "port": _normalize_proxy_credential(PROXY_PORT) or "80",
+        "username": _normalize_proxy_credential(PROXY_USER),
+        "password": _normalize_proxy_credential(PROXY_PASSWORD),
+    }
 
 
 def _proxies_for_requests() -> Optional[Dict[str, str]]:
@@ -191,20 +169,29 @@ def _capsolver_proxy_string() -> Optional[str]:
 def _get_token_capsolver() -> Optional[str]:
     """
     Obtiene un token reCAPTCHA v3 Enterprise vía CapSolver.
-    Usamos ProxyLess porque los workers de CapSolver no pueden usar proxy Oxylabs
-    (Oxylabs suele aceptar solo la IP del cliente). La petición al SII sigue yendo por Oxylabs.
+    Si hay proxy configurado (ej. residencial Chile), se usa ReCaptchaV3EnterpriseTask con ese proxy
+    para que el token se genere desde la misma IP que la petición al SII (evita captchaInvalido).
+    Sin proxy se usa ProxyLess.
     """
     if not CAPSOLVER_API_KEY:
         return None
     sitekey = (SII_RECAPTCHA_SITEKEY or SII_RECAPTCHA_SITEKEY_DEFAULT or "").strip() or SII_RECAPTCHA_SITEKEY_DEFAULT
-    # ProxyLess: CapSolver resuelve desde su IP. Si usamos proxy, Oxylabs rechaza la conexión desde sus workers.
-    task = {
-        "type": "ReCaptchaV3EnterpriseTaskProxyLess",
-        "websiteURL": SII_CONSULTA_URL,
-        "websiteKey": sitekey,
-        "pageAction": SII_RECAPTCHA_PAGE_ACTION,
-    }
-    proxy_str = None  # no pasar proxy a CapSolver
+    proxy_str = _capsolver_proxy_string()
+    if proxy_str:
+        task = {
+            "type": "ReCaptchaV3EnterpriseTask",
+            "websiteURL": SII_CONSULTA_URL,
+            "websiteKey": sitekey,
+            "pageAction": SII_RECAPTCHA_PAGE_ACTION,
+            "proxy": proxy_str,
+        }
+    else:
+        task = {
+            "type": "ReCaptchaV3EnterpriseTaskProxyLess",
+            "websiteURL": SII_CONSULTA_URL,
+            "websiteKey": sitekey,
+            "pageAction": SII_RECAPTCHA_PAGE_ACTION,
+        }
 
     create_url = f"{CAPSOLVER_API_URL}/createTask"
     result_url = f"{CAPSOLVER_API_URL}/getTaskResult"
@@ -252,7 +239,7 @@ def _get_token_capsolver() -> Optional[str]:
             solution = data.get("solution") or {}
             token = solution.get("gRecaptchaResponse")
             if token and isinstance(token, str) and len(token) > 20:
-                logger.info("[SII] Token obtenido vía CapSolver (proxy=%s)", bool(proxy_str))
+                logger.info("[SII] Token obtenido vía CapSolver (proxy=%s)", proxy_str is not None)
                 return token
             logger.warning("[SII] CapSolver solution sin gRecaptchaResponse: %s", solution)
             return None
@@ -265,13 +252,13 @@ def _get_token_capsolver() -> Optional[str]:
 
 def _crear_proxy_auth_extension(proxy_host: str, proxy_port: str, proxy_user: str, proxy_pass: str, out_dir: Path) -> str:
     """
-    Crea una extensión de Chrome para autenticación de proxy (Oxylabs u otro proxy residencial).
+    Crea una extensión de Chrome para autenticación de proxy (cualquier proveedor residencial).
     """
     plugin_path = out_dir / "proxy_auth_plugin.zip"
     manifest_json = json.dumps({
         "version": "1.0.0",
         "manifest_version": 2,
-        "name": "Oxylabs Proxy",
+        "name": "Proxy Auth",
         "permissions": ["proxy", "tabs", "unlimitedStorage", "storage", "<all_urls>", "webRequest", "webRequestBlocking"],
         "background": {"scripts": ["background.js"]},
         "minimum_chrome_version": "22.0.0"
@@ -415,21 +402,15 @@ def _crear_driver_uc():
     proxy_cfg = _get_proxy_config()
     if proxy_cfg:
         try:
-            #ext_path = _crear_proxy_auth_extension(
-             #   proxy_cfg["host"], proxy_cfg["port"],
-              #  proxy_cfg["username"], proxy_cfg["password"],
-            #)
             ext_path = _crear_proxy_auth_extension(
-                OXY_HOST, OXY_PORT,
-                OXY_USER, OXY_PASS,
+                proxy_cfg["host"], proxy_cfg["port"],
+                proxy_cfg["username"], proxy_cfg["password"],
                 profile_dir,
             )
             options.add_argument(f"--load-extension={ext_path}")
             logger.info("[SII] Proxy residencial configurado (UC): %s:%s", proxy_cfg["host"], proxy_cfg["port"])
         except Exception as e:
             logger.warning("[SII] No se pudo crear extensión de proxy para UC: %s", e)
-    elif not SII_SCRAPER_USE_PROXY:
-        logger.info("[SII] Proxy desactivado (SII_SCRAPER_USE_PROXY=false)")
 
     try:
         kwargs = {"options": options, "user_data_dir": str(profile_dir)}
@@ -487,8 +468,6 @@ def _crear_driver(headless: bool = True):
             logger.info("[SII] Proxy residencial configurado (extensión auth): %s:%s", proxy_cfg["host"], proxy_cfg["port"])
         except Exception as e:
             logger.warning("[SII] No se pudo crear extensión de proxy, continuando sin proxy: %s", e)
-    elif not SII_SCRAPER_USE_PROXY:
-        logger.info("[SII] Proxy desactivado (SII_SCRAPER_USE_PROXY=false)")
 
     try:
         service = Service(ChromeDriverManager().install())
@@ -708,13 +687,20 @@ def token_generator() -> None:
                 time.sleep(2)
 
 
+def _ssl_verify() -> Union[bool, str]:
+    """Verificación SSL para requests: PROXY_CA_BUNDLE (ruta) si está definido, sino PROXY_VERIFY_SSL (bool)."""
+    if PROXY_CA_BUNDLE:
+        return PROXY_CA_BUNDLE
+    return PROXY_VERIFY_SSL
+
+
 # ----------------------------
 # CONSULTA API SII (requests, sin Chrome por RUT)
 # ----------------------------
 def _consultar_sii_api(rut: str) -> Dict[str, Any]:
     """
-    Consulta el API getConsultaData del SII usando un token de la cola y requests.
-    Mismo proxy que Selenium (Oxylabs) si está configurado.
+    Consulta el API getConsultaData del SII usando un token (CapSolver o cola) y requests.
+    Con proxy: establece sesión (GET página SII + cookies) y luego POST con la misma IP.
     Returns: {"success", "activities", "not_found", "error"}
     """
     rut = _normalizar_rut(rut)
@@ -745,19 +731,78 @@ def _consultar_sii_api(rut: str) -> Dict[str, Any]:
     }
 
     proxies = _proxies_for_requests()
-    OXY_CERT = "/home/pc/carrierSync/oxylabs.crt"
+    verify = _ssl_verify()
+    # Debug básico de configuración de red (sin exponer credenciales)
     try:
-        r = requests.post(
-            SII_GET_CONSULTA_DATA_URL,
-            json=payload,
-            timeout=20,
-            proxies=proxies,
-            verify= OXY_CERT,
+        proxy_cfg = _get_proxy_config()
+        safe_proxy = None
+        if proxy_cfg:
+            user = proxy_cfg.get("username") or ""
+            safe_user = (user[:4] + "***") if user else ""
+            safe_proxy = {
+                "host": proxy_cfg.get("host"),
+                "port": proxy_cfg.get("port"),
+                "username": safe_user,
+            }
+        logger.info(
+            "[SII][debug] _consultar_sii_api rut=%s proxy_cfg=%s verify=%s has_token=%s",
+            rut,
+            safe_proxy,
+            verify,
+            bool(payload.get("reToken")),
         )
+    except Exception as debug_e:
+        logger.warning("[SII][debug] Error construyendo debug de proxy: %s", debug_e)
+
+    headers_api = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Origin": "https://www2.sii.cl",
+        "Referer": SII_CONSULTA_URL,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    try:
+        if proxies:
+            # Mismo flujo que script de prueba: sesión con GET previo para cookies, luego POST (misma IP)
+            session = requests.Session()
+            session.proxies = proxies
+            session.get(SII_CONSULTA_URL, headers=headers_api, timeout=20, verify=verify)
+            r = session.post(
+                SII_GET_CONSULTA_DATA_URL,
+                json=payload,
+                headers=headers_api,
+                timeout=20,
+                verify=verify,
+            )
+        else:
+            r = requests.post(
+                SII_GET_CONSULTA_DATA_URL,
+                json=payload,
+                headers=headers_api,
+                timeout=20,
+                verify=verify,
+            )
         r.raise_for_status()
-        data = r.json()
+        try:
+            data = r.json()
+        except ValueError:
+            # Si el SII devuelve algo que no es JSON, log completo para debug
+            logger.warning("[SII][debug] Respuesta no JSON getConsultaData status=%s body=%s", r.status_code, r.text[:500])
+            raise
+        logger.info(
+            "[SII][debug] getConsultaData ok status=%s captchaInvalido=%s tieneGirosNegocio=%s",
+            r.status_code,
+            data.get("captchaInvalido"),
+            data.get("tieneGirosNegocio"),
+        )
     except requests.RequestException as e:
-        logger.warning("[SII] Error request getConsultaData: %s", e)
+        logger.warning(
+            "[SII] Error request getConsultaData: %s (proxies=%s verify=%s)",
+            e,
+            bool(proxies),
+            verify,
+        )
         return {"success": False, "activities": [], "not_found": False, "error": str(e)}
 
     if data.get("captchaInvalido") is True:
