@@ -46,6 +46,7 @@ class SIIVMClient:
                 "activities": [],
                 "error": "VM_SII_SCRAPER_URL no configurada",
                 "not_found": False,
+                "raw_sii_response": None,
             }
 
         url = f"{self.vm_url}/api/v1/sii/giros"
@@ -53,14 +54,31 @@ class SIIVMClient:
 
         try:
             resp = requests.post(url, json=payload, timeout=self.timeout)
+            text = resp.text or ""
+            raw = {
+                "status_code": resp.status_code,
+                "body": text[:2000],
+                "headers": dict(resp.headers or {}),
+            }
             data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
             if resp.status_code != 200:
+                base_error = data.get("detail", data.get("error", text)) or f"HTTP {resp.status_code}"
+                msg = base_error
+                body_lower = (text or "").lower()
+                # Clasificación gruesa para análisis posterior
+                if resp.status_code in (403, 407) or "forbidden" in body_lower or "proxy" in body_lower:
+                    msg = f"ip_or_proxy_error: {base_error}"
+                elif resp.status_code == 429 or "captcha" in body_lower:
+                    msg = f"captcha_error: {base_error}"
+                else:
+                    msg = f"http_error: {base_error}"
                 return {
                     "success": False,
                     "rut": rut,
                     "activities": [],
-                    "error": data.get("detail", data.get("error", resp.text)) or f"HTTP {resp.status_code}",
+                    "error": msg,
                     "not_found": resp.status_code == 404 or data.get("not_found", False),
+                    "raw_sii_response": raw,
                 }
             # Normalizar a lista de actividades con formato esperado
             activities = data.get("activities", data.get("economicActivities", []))
@@ -70,6 +88,7 @@ class SIIVMClient:
                 "activities": activities,
                 "error": data.get("error"),
                 "not_found": data.get("not_found", False),
+                "raw_sii_response": raw,
             }
         except requests.exceptions.Timeout:
             logger.warning(f"Timeout consultando SII para RUT {rut}")
@@ -77,8 +96,9 @@ class SIIVMClient:
                 "success": False,
                 "rut": rut,
                 "activities": [],
-                "error": "Timeout al consultar SII",
+                "error": "timeout_error: Timeout al consultar SII",
                 "not_found": False,
+                "raw_sii_response": None,
             }
         except Exception as e:
             logger.exception(f"Error consultando SII para RUT {rut}: {e}")
@@ -86,8 +106,9 @@ class SIIVMClient:
                 "success": False,
                 "rut": rut,
                 "activities": [],
-                "error": str(e),
+                "error": f"client_error: {e}",
                 "not_found": False,
+                "raw_sii_response": None,
             }
 
     def activities_to_economic_activities(

@@ -187,63 +187,84 @@ def run_carga_giros(
                 }
             )
             not_processed += 1
-            continue
-
-        result = vm.get_giros_by_rut(tax_id)
-        processed += 1
-
-        if not result.get("success"):
-            if result.get("not_found"):
-                status = "not_found_sii"
-                not_found_in_sii += 1
-            else:
-                status = "sii_failed"
-                sii_failed += 1
-            details.append(
-                {
-                    "carrier_id": cid,
-                    "tax_id": tax_id,
-                    "status": status,
-                    "error_message": result.get("error"),
-                }
-            )
-            continue
-
-        activities_raw = result.get("activities", [])
-        economic_activities = vm.activities_to_economic_activities(activities_raw)
-        if not economic_activities:
-            details.append(
-                {
-                    "carrier_id": cid,
-                    "tax_id": tax_id,
-                    "status": "not_found_sii",
-                    "error_message": "Sin actividades en respuesta SII",
-                }
-            )
-            not_found_in_sii += 1
-            continue
-
-        ok = update_carrier_giros_sync(carrier["_id"], economic_activities)
-        if ok:
-            updated += 1
-            details.append(
-                {
-                    "carrier_id": cid,
-                    "tax_id": tax_id,
-                    "status": "updated",
-                    "activities_count": len(economic_activities),
-                }
-            )
         else:
-            not_processed += 1
-            details.append(
+            result = vm.get_giros_by_rut(tax_id)
+            processed += 1
+
+            if not result.get("success"):
+                if result.get("not_found"):
+                    status = "not_found_sii"
+                    not_found_in_sii += 1
+                else:
+                    status = "sii_failed"
+                    sii_failed += 1
+                details.append(
+                    {
+                        "carrier_id": cid,
+                        "tax_id": tax_id,
+                        "status": status,
+                        "error_message": result.get("error"),
+                        "raw_sii_response": result.get("raw_sii_response"),
+                    }
+                )
+            else:
+                activities_raw = result.get("activities", [])
+                economic_activities = vm.activities_to_economic_activities(activities_raw)
+                if not economic_activities:
+                    details.append(
+                        {
+                            "carrier_id": cid,
+                            "tax_id": tax_id,
+                            "status": "not_found_sii",
+                            "error_message": "Sin actividades en respuesta SII",
+                            "raw_sii_response": result.get("raw_sii_response"),
+                        }
+                    )
+                    not_found_in_sii += 1
+                else:
+                    ok = update_carrier_giros_sync(carrier["_id"], economic_activities)
+                    if ok:
+                        updated += 1
+                        details.append(
+                            {
+                                "carrier_id": cid,
+                                "tax_id": tax_id,
+                                "status": "updated",
+                                "activities_count": len(economic_activities),
+                            }
+                        )
+                    else:
+                        not_processed += 1
+                        details.append(
+                            {
+                                "carrier_id": cid,
+                                "tax_id": tax_id,
+                                "status": "not_processed",
+                                "error_message": "Error al actualizar documento",
+                            }
+                        )
+
+        # Actualizar progreso del job en DB después de cada carrier
+        try:
+            log_coll.update_one(
+                {"job_id": job_id},
                 {
-                    "carrier_id": cid,
-                    "tax_id": tax_id,
-                    "status": "not_processed",
-                    "error_message": "Error al actualizar documento",
-                }
+                    "$set": {
+                        "status": "running",
+                        "total_carriers": total,
+                        "processed": processed,
+                        "updated": updated,
+                        "not_found_in_sii": not_found_in_sii,
+                        "sii_failed": sii_failed,
+                        "not_processed": not_processed,
+                        "details": details,
+                        "ruts_no_encontrados_en_rt_carrier": ruts_no_en_rt_carrier,
+                    }
+                },
+                upsert=True,
             )
+        except Exception as e:
+            logger.warning("run_carga_giros: no se pudo actualizar progreso del job %s: %s", job_id, e)
 
     finished_at = datetime.utcnow()
     status = "completed" if processed == total and (updated + not_found_in_sii + sii_failed) == processed else "partial"
